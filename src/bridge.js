@@ -15,6 +15,19 @@ import { SnowLumaWebSocketClient, text } from '@snowluma/sdk';
 import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client.js';
 import { mdToPlain, splitForQQ } from './md-to-plain.js';
 import { SENSITIVE_RE } from './sensitive.js';
+import {
+  ensureSourceLibrary,
+  emptyLibrary,
+  seedSourceLibrary,
+  libraryStats,
+  capViolations,
+  buildDigestSourcesText,
+  buildExplorePrompt,
+  buildMaintainPrompt,
+  shouldExplore,
+  shouldMaintain,
+  resolveDocPath
+} from './source-library.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { safeFetchBuffer, validateFetchUrl, looksLikeImageBuffer } from './safe-fetch.js';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
@@ -571,7 +584,22 @@ function loadConfig() {
         maxChars: 1800,         // 发到 QQ 的正文长度上限
         saveToFile: false,      // 是否另外把完整版存成本地 Markdown（默认 false：只发 QQ 文本）
         topics: '',             // 关注方向（逗号/顿号分隔，留空=用默认清单）
-        promptHint: ''          // 额外追加到早报提示里的要求
+        promptHint: '',         // 额外追加到早报提示里的要求
+        // 信息源库（知识库）：一个可增长的、分类的信息获取来源文档。桥接只负责按周期
+        // 投递"探索/维护"任务提示，真正的探索由 AI 用浏览器工具完成并写回该文档。
+        sourceLibrary: {
+          enabled: false,       // 总开关
+          path: '',             // 文档路径；留空=管理员工作区下的「早报信息源库.md」
+          useInDigest: true,    // 早报是否引用该库里的来源
+          maxSourcesPerCategoryInPrompt: 8, // 早报提示里每分类最多列几条来源（控长度）
+          exploreEnabled: true, // 定期探索新来源
+          exploreEveryDays: 1,  // 每几天探索一次
+          explorePerRun: 2,     // 每次探索新增几个新来源（宁缺毋滥）
+          maintainEnabled: true,// 定期维护（可用性检查 + 淘汰 + 大企业/独角兽刷新）
+          maintainEveryDays: 7, // 每几天维护一次
+          maxSources: 60,       // 总来源数硬上限（只算启用中的），超过必须先淘汰
+          maxPerCategory: 10    // 单分类硬上限，防止某一类无限膨胀
+        }
       },
       feedback: {
         maxLength: 500,
@@ -660,6 +688,22 @@ function loadConfig() {
     topics: '',
     promptHint: '',
     ...(cfg.socialV2?.dailyDigest ?? {})
+  };
+  // sourceLibrary 是 dailyDigest 下的嵌套对象：旧 config.json 里即使写了 dailyDigest，
+  // 也不该丢掉 sourceLibrary 的默认值，所以再深合一层。
+  cfg.socialV2.dailyDigest.sourceLibrary = {
+    enabled: false,
+    path: '',
+    useInDigest: true,
+    maxSourcesPerCategoryInPrompt: 8,
+    exploreEnabled: true,
+    exploreEveryDays: 1,
+    explorePerRun: 2,
+    maintainEnabled: true,
+    maintainEveryDays: 7,
+    maxSources: 60,
+    maxPerCategory: 10,
+    ...(cfg.socialV2?.dailyDigest?.sourceLibrary ?? {})
   };
 
   return cfg;
@@ -940,6 +984,11 @@ async function main() {
   // 若状态声明留在原处会触发 TDZ（ReferenceError），因此提前声明。
   let dailyDigestTimer = null;
   let dailyDigestState = { lastRunDate: '', lastRunAt: 0, lastReason: '', lastManualAt: 0, history: [] };
+  // 信息源库的调度记账（持久化到 state/source-library.json）。
+  // 刻意不回写知识库文档：文档的唯一写手是 AI/管理员，避免两个写手互相覆盖。
+  let sourceLibraryState = {
+    lastExploreDate: '', lastMaintainDate: '', exploreRuns: 0, maintainRuns: 0, lastKind: '', lastAt: 0
+  };
 
   // 普通 QQ 表情（face）自动识别：把 [表情<id>] 解析成 [表情:名字]（如 475 -> [表情:/干饭]）。
   // 查的是 SnowLuma 自带的 sys-face-catalog.json，纯本地同步读取，找不到就回退成原样。
@@ -1832,6 +1881,7 @@ async function main() {
           scheduleOwnerProactive();
           // 每日早报：同样等模式确认后再启动时间检测（等待 DSH 就绪后才会有实际投递）
           loadDailyDigestState();
+          loadSourceLibraryState();
           scheduleDailyDigest();
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
         }
@@ -2820,6 +2870,22 @@ async function main() {
             for (const k of ['topics', 'promptHint']) {
               if (merged.dailyDigest[k] !== undefined) merged.dailyDigest[k] = String(merged.dailyDigest[k] ?? '');
             }
+            // sourceLibrary：嵌套对象单独归一化（不能只靠外层 spread，否则会丢掉默认字段）
+            if (body.dailyDigest.sourceLibrary && typeof body.dailyDigest.sourceLibrary === 'object') {
+              const curSl = current.dailyDigest?.sourceLibrary ?? {};
+              const sl = { ...curSl, ...body.dailyDigest.sourceLibrary };
+              for (const k of ['exploreEveryDays', 'explorePerRun', 'maintainEveryDays', 'maxSources', 'maxPerCategory', 'maxSourcesPerCategoryInPrompt']) {
+                if (sl[k] !== undefined) {
+                  const n = Number(sl[k]);
+                  sl[k] = Number.isFinite(n) ? Math.max(1, Math.round(n)) : curSl[k] ?? 1;
+                }
+              }
+              for (const k of ['enabled', 'useInDigest', 'exploreEnabled', 'maintainEnabled']) {
+                if (sl[k] !== undefined) sl[k] = sl[k] === true;
+              }
+              if (sl.path !== undefined) sl.path = String(sl.path ?? '').trim();
+              merged.dailyDigest.sourceLibrary = sl;
+            }
           }
           if (merged.enabled !== undefined) merged.enabled = merged.enabled === true;
           if (merged.provideRecommendations !== undefined) merged.provideRecommendations = merged.provideRecommendations === true;
@@ -2871,6 +2937,21 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/daily-digest/run') {
           const ok = await tryDailyDigest('manual');
           sendJson({ ok, message: ok ? '已投递早报任务' : '未投递（未启用 / DSH 未就绪 / 无管理员会话）' });
+          return;
+        }
+        // ── 信息源库：查看状态 / 手动触发探索或维护 ──────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/source-library') {
+          sendJson({ ok: true, status: sourceLibraryStatus() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/source-library/explore') {
+          const ok = await trySourceLibraryTask('explore', 'manual');
+          sendJson({ ok, message: ok ? '已投递信息源探索任务' : '未投递（未启用 / DSH 未就绪 / 无管理员会话）' });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/source-library/maintain') {
+          const ok = await trySourceLibraryTask('maintain', 'manual');
+          sendJson({ ok, message: ok ? '已投递信息源维护任务' : '未投递（未启用 / DSH 未就绪 / 无管理员会话）' });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
@@ -7958,14 +8039,29 @@ async function main() {
     const saveDir = cfg.dsh?.ownerWorkspace ? String(cfg.dsh.ownerWorkspace) : '';
     const savePath = (p.saveToFile !== false && saveDir) ? `${saveDir}\\早报\\${localDateStr(now.getTime())}.md` : '';
     const extra = String(p.promptHint ?? '').trim();
+    // 信息源库：把知识库里积累的来源作为本次早报的取材清单，插在「关注方向」和「采集要求」之间。
+    const srcLines = [];
+    const sl = sourceLibraryCfg();
+    if (sl.enabled && sl.useInDigest) {
+      const lib = readSourceLibrary();
+      if (lib && libraryStats(lib).live > 0) {
+        srcLines.push(
+          `取材优先用信息源库里的来源（文档：${sourceLibraryPath()}）：`,
+          buildDigestSourcesText(lib, { maxPerCategory: sl.maxSourcesPerCategoryInPrompt }),
+          '先从上面这些来源找；它们都没新内容时，可以额外打开一两个别的公开来源补充，并把好用的新来源记下来（下次探索会收录）。');
+      } else {
+        srcLines.push(`（信息源库已启用但还没有可用来源：${sourceLibraryPath()}）`);
+      }
+    }
     const lines = [
       `【每日早报】现在是 ${localDateStr(now.getTime())} ${weekday} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}，请给管理员做今天的早报。`,
       `范围：只整理最近 ${windowHours} 小时内的新内容。`,
       `① 科研论文：最多 ${maxPapers} 篇，每篇给「标题 / 来源（arXiv 等）/ 一句话结论 / 为什么值得看 / 链接」。`,
       `② 科技巨头动向：最多 ${maxNews} 条，每条给「谁做了什么（一句话事实）/ 意味着什么 / 链接」。`,
       `关注方向：${topics}`,
+      ...srcLines,
       '采集要求（只读，不要登录、不要输入任何账号密码）：',
-      '· 用浏览器工具打开公开只读页面采集，例如 arXiv 的 cs.AI / cs.CL / cs.LG recent 列表、Hacker News、Techmeme 等科技新闻聚合站，以及厂商官方博客。',
+      '· 用浏览器工具打开公开只读页面采集（上面信息源库列出的站点就是首选；库里没有合适来源时再用 arXiv 的 cs.AI / cs.CL / cs.LG recent、Hacker News、Techmeme 等通用来源）。',
       '· 重点看"今天/最近一两天"的新条目，别拿旧闻充数；同一事件只保留一条，优先一手来源（论文原文、官方博客）。',
       '· 某个站点打不开、需要登录或被反爬拦住时，换一个来源即可，不要为了拿数据去登录或输入凭据。',
       '· 宁可少写几条也不要编造：所有条目必须来自你这次实际打开过的页面；确实采集不到就直接说明"今天没能采集到"，并写清卡在哪里。',
@@ -8053,6 +8149,185 @@ async function main() {
       log(`[早报] 今天的触发点已过去 ${Math.round(lateMs / 60000)} 分钟，超出补跑窗口，跳过（明天照常）`);
     }
   }
+  // ── 信息源库（早报的知识库）────────────────────────────────────────────────
+  // 设计：桥接只负责「到点投递一条探索/维护任务提示」，真正的探索由 AI 用浏览器
+  // 工具完成并写回文档。桥接不做抓取、不存凭据，只解析文档 + 调度 + 注入提示词。
+  //
+  // 重要：文档的写入方只有一个 —— AI（或管理员手工编辑）。桥接**从不**回写文档，
+  // 因为"桥接读文档 → 投递任务 → 回写 meta"会和 AI 的写回互相覆盖（同一文件两个写手）。
+  // 调度用的"上次探索/维护日"因此存在桥接自己的状态文件里（与早报的 lastRunDate 同一套思路），
+  // 同时把文档 meta 里的日期作为兜底参考取较晚者，这样换了机器/重置状态也不会立刻重复探索。
+
+  function sourceLibraryStateFile() {
+    return path.join(STATE_DIR, 'source-library.json');
+  }
+  function loadSourceLibraryState() {
+    const raw = readJsonSafe(sourceLibraryStateFile(), null);
+    if (raw && typeof raw === 'object') {
+      sourceLibraryState = {
+        lastExploreDate: String(raw.lastExploreDate ?? ''),
+        lastMaintainDate: String(raw.lastMaintainDate ?? ''),
+        exploreRuns: Math.max(0, Number(raw.exploreRuns) || 0),
+        maintainRuns: Math.max(0, Number(raw.maintainRuns) || 0),
+        lastKind: String(raw.lastKind ?? ''),
+        lastAt: Number(raw.lastAt) || 0
+      };
+    }
+  }
+  function saveSourceLibraryState() {
+    try { atomicWriteJson(sourceLibraryStateFile(), sourceLibraryState); } catch (error) { log('[信息源库] 状态写入失败:', error?.message ?? error); }
+  }
+  // 取较晚的日期：桥接状态 vs 文档 meta（谁也不能让调度倒退）
+  function laterDate(a, b) {
+    const s = String(a ?? '').trim();
+    const t = String(b ?? '').trim();
+    if (!s) return t;
+    if (!t) return s;
+    return s >= t ? s : t;
+  }
+
+  function sourceLibraryCfg() {
+    const p = cfg.socialV2?.dailyDigest ?? {};
+    const sl = p.sourceLibrary ?? {};
+    return {
+      enabled: sl.enabled === true,
+      path: String(sl.path ?? '').trim(),
+      useInDigest: sl.useInDigest !== false,
+      maxSourcesPerCategoryInPrompt: Math.max(1, Number(sl.maxSourcesPerCategoryInPrompt) || 8),
+      exploreEnabled: sl.exploreEnabled !== false,
+      exploreEveryDays: Math.max(1, Number(sl.exploreEveryDays) || 1),
+      explorePerRun: Math.min(5, Math.max(1, Number(sl.explorePerRun) || 2)),
+      maintainEnabled: sl.maintainEnabled !== false,
+      maintainEveryDays: Math.max(1, Number(sl.maintainEveryDays) || 7),
+      maxSources: Math.max(1, Number(sl.maxSources) || 60),
+      maxPerCategory: Math.max(1, Number(sl.maxPerCategory) || 10)
+    };
+  }
+  function sourceLibraryPath() {
+    const sl = sourceLibraryCfg();
+    return resolveDocPath({ path: sl.path }, cfg.dsh?.ownerWorkspace);
+  }
+  // 读取（必要时先落一份种子文档）。任何异常都返回 null，绝不让早报因为知识库坏掉而失败。
+  function readSourceLibrary() {
+    if (!sourceLibraryCfg().enabled) return null;
+    try {
+      const file = sourceLibraryPath();
+      const { lib, created } = ensureSourceLibrary(file);
+      if (created) log(`[信息源库] 文档不存在，已生成起步来源：${file}`);
+      return lib;
+    } catch (error) {
+      log('[信息源库] 读取失败:', error?.message ?? error);
+      return null;
+    }
+  }
+  // 把调度用日期合并进从文档读到的 lib，供 shouldExplore/shouldMaintain 判定。
+  function sourceLibraryWithSchedule(lib) {
+    const merged = { ...(lib ?? {}), meta: { ...(lib?.meta ?? {}) } };
+    merged.meta.lastExploreDate = laterDate(sourceLibraryState.lastExploreDate, lib?.meta?.lastExploreDate);
+    merged.meta.lastMaintainDate = laterDate(sourceLibraryState.lastMaintainDate, lib?.meta?.lastMaintainDate);
+    return merged;
+  }
+  function sourceLibraryStatus() {
+    const sl = sourceLibraryCfg();
+    const file = sourceLibraryPath();
+    const lib = readSourceLibrary();
+    const stats = lib ? libraryStats(lib) : null;
+    const scheduled = lib ? sourceLibraryWithSchedule(lib) : null;
+    return {
+      enabled: sl.enabled,
+      path: file,
+      exists: fs.existsSync(file),
+      useInDigest: sl.useInDigest,
+      exploreEnabled: sl.exploreEnabled,
+      exploreEveryDays: sl.exploreEveryDays,
+      explorePerRun: sl.explorePerRun,
+      maintainEnabled: sl.maintainEnabled,
+      maintainEveryDays: sl.maintainEveryDays,
+      maxSources: sl.maxSources,
+      maxPerCategory: sl.maxPerCategory,
+      lastExploreDate: scheduled?.meta?.lastExploreDate ?? '',
+      lastMaintainDate: scheduled?.meta?.lastMaintainDate ?? '',
+      exploreRuns: sourceLibraryState.exploreRuns,
+      maintainRuns: sourceLibraryState.maintainRuns,
+      total: stats?.total ?? 0,
+      live: stats?.live ?? 0,
+      retired: stats?.retired ?? 0,
+      categories: stats?.categories ?? [],
+      overdue: scheduled ? { explore: shouldExplore(scheduled, sl), maintain: shouldMaintain(scheduled, sl) } : null
+    };
+  }
+
+  // 投递一次探索/维护任务，并记账。
+  // 记账时点是"投递成功"，不是"AI 写完文件"——AI 写回是异步的、桥接无法观测。
+  // 若 AI 那次没能写回，文档里的内容不会变，但调度日期已推进：下一轮不会重复投递，
+  // 直到下一个周期。这是刻意的：宁可漏一次，也不要因为写回失败而反复骚扰管理员。
+  async function trySourceLibraryTask(kind = 'explore', reason = 'scheduled') {
+    try {
+      const sl = sourceLibraryCfg();
+      if (!sl.enabled) { log('[信息源库] 未启用，跳过'); return false; }
+      const key = ownerProactiveKey();
+      if (!key || !isOwnerToolsKey(key)) { log('[信息源库] 没有可用的管理员工具会话，跳过'); return false; }
+      if (!dshReady) { log('[信息源库] DSH 未就绪，跳过'); return false; }
+      if (currentMode !== 'reserved2') { log(`[信息源库] 当前模式非 reserved2（${currentMode}），跳过`); return false; }
+
+      const file = sourceLibraryPath();
+      let lib = readSourceLibrary();
+      if (!lib) {
+        // 文档读不出来（例如被别处占用）→ 用一份最小结构生成提示，保证任务仍能投递
+        lib = seedSourceLibrary(emptyLibrary(), localDateStr());
+        log('[信息源库] 文档不可读，本次任务使用内存中的起步结构');
+      }
+      const today = localDateStr();
+      const promptText = kind === 'maintain'
+        ? buildMaintainPrompt({ docPath: file, lib, cfg: sl, today })
+        : buildExplorePrompt({ docPath: file, lib, cfg: sl, today });
+
+      await deliverPrompt(key, promptText);
+
+      // 只写桥接侧状态，绝不回写文档（文档的写手只有 AI/管理员）
+      if (kind === 'maintain') {
+        sourceLibraryState.lastMaintainDate = today;
+        sourceLibraryState.maintainRuns += 1;
+      } else {
+        sourceLibraryState.lastExploreDate = today;
+        sourceLibraryState.exploreRuns += 1;
+      }
+      sourceLibraryState.lastKind = kind;
+      sourceLibraryState.lastAt = Date.now();
+      saveSourceLibraryState();
+
+      const violations = capViolations(lib, sl);
+      if (violations.length) log(`[信息源库] 当前超限：${violations.join('；')}`);
+      log(`[信息源库] 已投递${kind === 'maintain' ? '维护' : '探索'}任务（${reason}）：文档现有 ${libraryStats(lib).live} 条启用来源`);
+      appendActivity(`${key} [信息源库] 已投递${kind === 'maintain' ? '维护' : '探索'}任务（${reason}）`);
+      return true;
+    } catch (error) {
+      log('[信息源库] 投递异常:', error?.message ?? error);
+      return false;
+    }
+  }
+
+  // 周期性检测：与早报共用同一个检测循环，但各自独立判定（早报只跑一次/天，
+  // 知识库按 exploreEveryDays / maintainEveryDays 的间隔跑）。
+  async function sourceLibraryTick() {
+    const sl = sourceLibraryCfg();
+    if (!sl.enabled) return;
+    // 早报总开关关掉时不单独跑知识库任务（它是早报的子功能）
+    if (cfg.socialV2?.dailyDigest?.enabled !== true) return;
+    if (!dshReady || currentMode !== 'reserved2') return;
+    const lib = readSourceLibrary();
+    if (!lib) return;
+    const scheduled = sourceLibraryWithSchedule(lib);
+    const today = localDateStr();
+    if (shouldMaintain(scheduled, sl, today)) {
+      await trySourceLibraryTask('maintain', 'scheduled');
+      return;
+    }
+    if (shouldExplore(scheduled, sl, today)) {
+      await trySourceLibraryTask('explore', 'scheduled');
+    }
+  }
+
   // 启动周期检测（幂等：已在运行则不重复创建）。
   function scheduleDailyDigest() {
     const p = cfg.socialV2?.dailyDigest ?? {};
@@ -8061,11 +8336,19 @@ async function main() {
     const checkMs = Math.max(10 * 1000, Number(p.checkIntervalMs) || 60000);
     dailyDigestTimer = setInterval(() => {
       void dailyDigestTick().catch((error) => log('[早报] 检测异常:', error?.message ?? error));
+      // 信息源库的探索/维护与自己早报的触发点解耦：共用这个检测循环，
+      // 但按各自的天数间隔判定（默认每天探索、每周维护）。
+      void sourceLibraryTick().catch((error) => log('[信息源库] 检测异常:', error?.message ?? error));
     }, checkMs);
     dailyDigestTimer.unref?.();
     // 启动后立刻检测一次（例如桥接 08:30 才起来，仍在补跑窗口内就马上补今天的早报）
     void dailyDigestTick().catch((error) => log('[早报] 首次检测异常:', error?.message ?? error));
+    void sourceLibraryTick().catch((error) => log('[信息源库] 首次检测异常:', error?.message ?? error));
+    const sl = sourceLibraryCfg();
     log(`[早报] 已启动时间检测（每 ${Math.round(checkMs / 1000)}s 一次），触发时刻 ${String(p.time ?? '08:00')}，补跑窗口 ${p.catchUpMinutes ?? 180} 分钟`);
+    if (sl.enabled) {
+      log(`[信息源库] 已启用：${sourceLibraryPath()}（每 ${sl.exploreEveryDays} 天探索 ${sl.explorePerRun} 条 / 每 ${sl.maintainEveryDays} 天维护一次，上限 ${sl.maxSources} 条、单分类 ${sl.maxPerCategory} 条）`);
+    }
   }
   function stopDailyDigest() {
     if (!dailyDigestTimer) return;
@@ -8354,6 +8637,59 @@ async function main() {
         await sendToQQ(key, lines.join('\n'));
         return;
       }
+      // 信息源库状态：支持「信息源状态 / 来源状态 / 信息源库」
+      const srcLibStateRe = /^(?:信息源|信息源库|来源|来源库|知识库)(?:状态|设置|配置|列表|库)?\s*[！!。.]?\s*$/;
+      if (srcLibStateRe.test(roleText)) {
+        const s = sourceLibraryStatus();
+        if (!s.enabled) {
+          await sendToQQ(key, `信息源库当前是关闭状态（config.json → socialV2.dailyDigest.sourceLibrary.enabled=false）。开启后我会每天探索一两个新来源、定期维护，并在早报里优先从这些来源取材。`);
+          return;
+        }
+        const catLines = s.categories
+          .filter((c) => c.total > 0)
+          .map((c) => `· ${c.name}：${c.live} 条${c.retired ? `（停用 ${c.retired}）` : ''}`);
+        const lines = [
+          `信息源库：已开启`,
+          `文档：${s.path}`,
+          `来源总数：${s.live} 条启用${s.retired ? ` / ${s.retired} 条停用` : ''}（上限 ${s.maxSources} 条，单分类 ${s.maxPerCategory} 条）`,
+          `探索：每 ${s.exploreEveryDays} 天 1 次，每次新增 ${s.explorePerRun} 条｜上次：${s.lastExploreDate || '（还没有）'}`,
+          `维护：每 ${s.maintainEveryDays} 天 1 次｜上次：${s.lastMaintainDate || '（还没有）'}`,
+          `早报取材：${s.useInDigest ? '优先用库里的来源' : '不引用（用默认来源清单）'}`,
+          catLines.length ? '分类：' : '',
+          ...catLines,
+          '想要马上探索或维护，发「探索来源」/「维护来源」。'
+        ].filter(Boolean);
+        await sendToQQ(key, lines.join('\n'));
+        return;
+      }
+      // 手动触发信息源探索：支持「探索来源 / 探索信息源 / 找新来源」
+      const srcLibExploreRe = /^(?:探索|找|挖掘|搜集)\s*(?:新)?\s*(?:来源|信息源|网站|网址)\s*[！!。.]?\s*$/;
+      if (srcLibExploreRe.test(roleText)) {
+        const s = sourceLibraryStatus();
+        if (!s.enabled) {
+          await sendToQQ(key, `信息源库当前是关闭状态（config.json → socialV2.dailyDigest.sourceLibrary.enabled=false），先开启才能探索。`);
+          return;
+        }
+        const started = await trySourceLibraryTask('explore', 'manual');
+        await sendToQQ(key, started
+          ? '好，我去找几个新来源试试看，确认能打开再收录进信息源库，完事跟你说一声…'
+          : '现在没法跑探索（DSH 未就绪或没有可用的管理员会话），稍后再试一次。');
+        return;
+      }
+      // 手动触发信息源维护：支持「维护来源 / 维护信息源 / 清理来源」
+      const srcLibMaintainRe = /^(?:维护|清理|整理|检查|体检)\s*(?:来源|信息源|网站|网址|信息源库)\s*[！!。.]?\s*$/;
+      if (srcLibMaintainRe.test(roleText)) {
+        const s = sourceLibraryStatus();
+        if (!s.enabled) {
+          await sendToQQ(key, `信息源库当前是关闭状态（config.json → socialV2.dailyDigest.sourceLibrary.enabled=false），先开启才能维护。`);
+          return;
+        }
+        const started = await trySourceLibraryTask('maintain', 'manual');
+        await sendToQQ(key, started
+          ? '好，我去给信息源库做一次体检：能用的留下，废掉的停用，顺手刷新一下大企业和独角兽清单…'
+          : '现在没法跑维护（DSH 未就绪或没有可用的管理员会话），稍后再试一次。');
+        return;
+      }
       // 查看所有可用指令
       const helpRe = /^(?:help|帮助|指令|命令|指令列表|命令列表|查看指令|查看命令|有哪些指令)[！!。.]?\s*$/;
       if (helpRe.test(roleText)) {
@@ -8363,6 +8699,9 @@ async function main() {
           '· 关闭dsh / 关闭服务 / shutdown — 关闭 DSH（桥接保持，可再「重启dsh」拉起）',
           '· 早报 — 立即整理一份今日早报（论文摘要 + 科技动向）',
           '· 早报状态 — 查看早报开关、时间、范围与上次/下次执行时间',
+          '· 信息源库（或「信息源状态」）— 查看信息源库开关、文档路径、分类与探索/维护进度',
+          '· 探索来源 — 立即找 1~2 个新来源并收录进信息源库',
+          '· 维护来源 — 立即体检信息源库（停用失效来源、刷新大企业与独角兽清单）',
           '· help / 帮助 / 指令 — 查看本帮助',
           '· 查看角色卡 / 查看人格 — 查看可用角色卡与人格配置',
           '· 进入角色扮演 X / 切换角色 X — 设置本会话角色',

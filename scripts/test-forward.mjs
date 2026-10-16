@@ -98,12 +98,15 @@ try {
 // 5. 桥接端点安全拒绝（可选，桥接运行且状态存在时）
 const consoleTokenFile = path.join(ROOT, 'state', 'console-token');
 const socialV2File = path.join(ROOT, 'state', 'social-v2.json');
-if (fs.existsSync(consoleTokenFile) && fs.existsSync(socialV2File)) {
+if (fs.existsSync(socialV2File)) {
   try {
     const config = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8'));
     const social = JSON.parse(fs.readFileSync(socialV2File, 'utf8'));
     const conv = social?.conversations ? Object.entries(social.conversations)[0] : null;
-    const consoleToken = fs.readFileSync(consoleTokenFile, 'utf8').trim();
+    // 鉴权 token 的取值顺序必须与 bridge.js 一致：config.json 里手工配置的 consoleToken 优先，
+    // 只有它为空时才回退到 state/console-token（自动生成的）。反过来读会拿到过期 token，全部 401。
+    const consoleToken = String(config.consoleToken || '').trim()
+      || (fs.existsSync(consoleTokenFile) ? fs.readFileSync(consoleTokenFile, 'utf8').trim() : '');
     if (conv) {
       const [key, st] = conv;
       const agentToken = st?.agentToken;
@@ -129,7 +132,7 @@ if (fs.existsSync(consoleTokenFile) && fs.existsSync(socialV2File)) {
     console.log(`⚠️ 桥接端点检查跳过：${error?.message ?? error}`);
   }
 } else {
-  console.log('⚠️ 跳过桥接端点检查：缺少 state/console-token 或 state/social-v2.json');
+  console.log('⚠️ 跳过桥接端点检查：缺少 state/social-v2.json');
 }
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`);

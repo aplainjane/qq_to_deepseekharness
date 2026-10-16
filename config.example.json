@@ -199,7 +199,20 @@
       "maxChars": 1800,
       "saveToFile": false,
       "topics": "",
-      "promptHint": ""
+      "promptHint": "",
+      "sourceLibrary": {
+        "enabled": false,
+        "path": "",
+        "useInDigest": true,
+        "maxSourcesPerCategoryInPrompt": 8,
+        "exploreEnabled": true,
+        "exploreEveryDays": 1,
+        "explorePerRun": 2,
+        "maintainEnabled": true,
+        "maintainEveryDays": 7,
+        "maxSources": 60,
+        "maxPerCategory": 10
+      }
     }
   },
   "startup": {

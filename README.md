@@ -254,9 +254,129 @@ POST /api/socialV2/daily-digest/run   立即手动跑一次
 POST /api/socialV2/config             改 dailyDigest 参数（改完立即重排检测，不必重启桥接）
 ```
 
-辅助脚本 `node scripts/console-api.mjs digest|digest-run|restart|dsh-restart` 可以直接调这些接口与重启桥接/DSH，不用手写 token。
+辅助脚本 `node scripts/console-api.mjs digest|digest-run|sources|sources-explore|sources-maintain|restart|dsh-restart` 可以直接调这些接口与重启桥接/DSH，不用手写 token。
 
 QQ 里也可以直接对管理员账号说「早报」立即执行一次、「早报状态」查看配置与上次/下次时间。
+
+---
+
+## 早报信息源库（会自动长大的知识库）
+
+早报默认只会去几个固定站点取材。**信息源库**把这个过程变成一个会自己积累的知识库：一个单独的 Markdown 文档，按分类记录可用的信息获取来源，桥接定期投递任务让 AI 去**探索新来源**、**维护已有来源**，早报再优先从这个库里取材。长期下来它会形成一套自己的「探索路径」，而不是每天从零找。
+
+它和早报共用同一个配置块（`socialV2.dailyDigest.sourceLibrary`）：
+
+```json
+"sourceLibrary": {
+  "enabled": true,
+  "path": "",
+  "useInDigest": true,
+  "maxSourcesPerCategoryInPrompt": 8,
+  "exploreEnabled": true,
+  "exploreEveryDays": 1,
+  "explorePerRun": 2,
+  "maintainEnabled": true,
+  "maintainEveryDays": 7,
+  "maxSources": 60,
+  "maxPerCategory": 10
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | 总开关。`false` 时完全不探索、不维护、早报也不引用库里来源（早报本身照常跑） |
+| `path` | 知识库文档路径。留空 = `dsh.ownerWorkspace\早报信息源库.md`；可以指到任意位置（如网盘目录） |
+| `useInDigest` | 早报是否把库里的来源作为首选取材清单 |
+| `maxSourcesPerCategoryInPrompt` | 早报提示里每个分类最多列几条（控制提示词长度，不影响库里实际存量） |
+| `exploreEnabled` / `exploreEveryDays` | 是否定期探索新来源、每几天探索一次 |
+| `explorePerRun` | 每次探索新增几条新来源（默认 2，上限 5）。**刻意设小**，避免一次塞一堆没验证过的站 |
+| `maintainEnabled` / `maintainEveryDays` | 是否定期维护、每几天维护一次 |
+| `maxSources` | 启用来源的**硬上限**（默认 60），超过时提示词会要求先淘汰再新增 |
+| `maxPerCategory` | 单分类硬上限（默认 10），防止某一类无限膨胀 |
+
+### 文档结构
+
+文档是「人类可读可编辑 + 机器可解析」的 Markdown，分两层：
+
+```markdown
+# 早报信息源库
+
+<!-- source-library-meta
+{ "lastExploreDate": "2026-10-16", "exploreRuns": 3, ... }
+-->
+
+## 论文与预印本
+
+| 来源 | 网址 | 用途 | 状态 | 加入日 | 上次验证 | 命中 | 备注 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| arXiv cs.AI 最新 | https://arxiv.org/list/cs.AI/recent | 论文列表 | active | 2026-10-16 | 2026-10-16 | 0 | 一手来源 |
+
+## 探索日志
+
+- 2026-10-16 新增（探索·顺藤摸瓜）：Simon Willison's Weblog —— 线索来自 Hacker News 首页当天高赞讨论…
+```
+
+- **每个 `##` 分类就是一条探索路径**（论文与预印本 / 科研机构 / 新闻聚合 / 公司与组织 / 中文科技圈 / 社区与讨论）。分类是开放的：AI 觉得有必要时可以新开一个，解析器不会只认默认那几个。
+- **分类名下的表格列顺序固定**（`来源 / 网址 / 用途 / 状态 / 加入日 / 上次验证 / 命中 / 备注`），但解析器是按表头名字定位列的，所以**多一列少一列都不会崩**，手工编辑也不必严格对齐。
+- `状态`：`active` 常用 / `watch` 观察 / `retired` 已停用（保留记录，采集时跳过）。
+- `## 探索日志` 记录「从哪条线索发现了哪个新来源」，保留最近 40 条 —— 这是让探索路径可追溯、也是防止文档无限膨胀的闸门。
+
+解析器对坏数据是**宽容**的：元信息 JSON 写坏了、表格缺列、分类里有奇怪的条目，都会降级处理而不是抛错（早报不会因为知识库被写坏而失败）。
+
+### 探索与维护怎么跑
+
+桥接和早报共用同一个 60 秒检测循环，但各自独立判定：
+
+- **维护优先**：`应该维护`（距 `lastMaintainDate` ≥ `maintainEveryDays`）就先投维护任务，本轮不再投探索；
+- 否则看 `应该探索`（距 `lastExploreDate` ≥ `exploreEveryDays`）→ 投探索任务。
+
+**桥接投递的是任务提示，不是数据。** 具体内容：
+
+- **探索任务**：告诉 AI 去读了文档、找一个**确实能打开**的新来源，并明确要求「先用浏览器实际打开确认可读再收录，打不开或要登录的直接放弃」「优先一手来源（论文库、官方博客、新闻室）」「优先从已有来源顺藤摸瓜」「一个合格来源都没找到就别硬凑」。
+- **维护任务**：做可用性抽查、去重归位、把长期 `命中` 为 0 或已失效的来源标 `retired`、更新「上次验证」日期，并**刷新「公司与组织（大企业 / 独角兽）」清单**（补新公司、移除已不活跃的）。
+
+**不无限增长**由三道闸门保证：① 每次只允许加 `explorePerRun` 条；② 总量/单分类硬上限，超限时提示词会把「必须先淘汰再新增」和超限明细一起给 AI；③ 探索日志保留 40 条上限。
+
+### 谁写这个文档
+
+**只有 AI（或你手工编辑）写这个文档，桥接从不回写它。** 桥接侧只把调度日期记在自己的 `state/source-library.json` 里。
+
+这是刻意的设计：如果桥接在「投递任务」时也去更新文档里的 `lastExploreDate`，就会和 AI 的写回撞车 —— 同一个文件两个写手，后写的会覆盖先写的，AI 辛苦找到的新来源可能被桥接的一次 meta 更新抹掉。所以职责切成：桥接负责**读 + 调度 + 投递**，AI 负责**写**。
+
+调度判定取「桥接状态」与「文档 meta」两者中**较晚**的日期，所以即使你换了机器、清了 `state/`，也不会因为文档里记着日期就立刻重复探索；反过来手工把文档里的日期往前改，也能强制它下一轮就探索。
+
+### 状态与控制台
+
+状态持久化在 `state/source-library.json`（`lastExploreDate` / `lastMaintainDate` / `exploreRuns` / `maintainRuns` / `lastKind` / `lastAt`）。
+
+```text
+GET  /api/socialV2/source-library           查看开关、文档路径、分类存量、上次/是否该跑
+POST /api/socialV2/source-library/explore   立即投递一次探索任务
+POST /api/socialV2/source-library/maintain  立即投递一次维护任务
+```
+
+```bash
+node scripts/console-api.mjs sources            # 看知识库状态与分类存量
+node scripts/console-api.mjs sources-explore    # 立刻探索
+node scripts/console-api.mjs sources-maintain   # 立刻维护
+```
+
+QQ 里对管理员账号可以说「信息源库」看状态、「探索来源」立刻探索、「维护来源」立刻维护。
+
+离线校验解析 / 渲染 / 上限 / 调度判定 / 提示词生成：
+
+```bash
+node scripts/test-source-library.mjs
+```
+
+覆盖 54 个断言：往返一致性、表格转义（内容含 `|` 不能破坏列对齐）、元信息损坏容错、缺列容错、去重键（`www` / 协议 / 尾斜杠 / `utm` 参数）、上限告警、间隔判定与跨月天数、提示词必含项、文档缺失时自动落地种子库、路径解析。
+
+### 首次启用会发生什么
+
+`enabled: true` 后，如果文档不存在，桥接会**自动生成一份起步来源**（约 20 条：arXiv 三个分类、各主要实验室博客、HN/Techmeme 等聚合站、几家大企业与独角兽、中文科技圈、以及社区评测站），然后立刻投第一个任务 —— 因为 `lastExploreDate` 为空，`shouldExplore` 判定为「很久没探索过」。
+
+所以第一次启用就会看到 AI 去探索，这是预期行为，不是重复触发。
+
 
 > 采集侧的边界：科技媒体与社交平台多半需要登录，而早报的设计原则是**只读采集、绝不登录**——提示里写明了“打不开就换来源，不要为了拿数据去登录或输入凭据；宁可少写几条也不要编造”。这是提示词层面的约束（浏览器工具本身具备完整的点击/输入能力），因此早报无法、也不会去拿需要登录才能看到的付费或私密内容；遇到这类站点（例如正文被付费墙或 Cloudflare 拦截）会记录在早报末尾的采集说明里。
 

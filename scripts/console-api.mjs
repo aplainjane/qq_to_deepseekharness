@@ -7,8 +7,12 @@ const path = action === 'dsh-restart' ? '/api/dsh/restart'
   : action === 'restart' ? '/api/restart'
   : action === 'digest' ? '/api/socialV2/daily-digest'
   : action === 'digest-run' ? '/api/socialV2/daily-digest/run'
+  : action === 'sources' ? '/api/socialV2/source-library'
+  : action === 'sources-explore' ? '/api/socialV2/source-library/explore'
+  : action === 'sources-maintain' ? '/api/socialV2/source-library/maintain'
   : '/api/status';
-const method = (action === 'dsh-restart' || action === 'restart' || action === 'digest-run') ? 'POST' : 'GET';
+const method = (action === 'dsh-restart' || action === 'restart' || action === 'digest-run'
+  || action === 'sources-explore' || action === 'sources-maintain') ? 'POST' : 'GET';
 (async () => {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${path}?token=${encodeURIComponent(token)}`, {
@@ -17,6 +21,20 @@ const method = (action === 'dsh-restart' || action === 'restart' || action === '
       body: method === 'POST' ? '{}' : undefined
     });
     const txt = await res.text();
+    // sources 状态是嵌套 JSON，压平一点便于阅读
+    if (action === 'sources' && res.ok) {
+      try {
+        const s = JSON.parse(txt).status;
+        console.log(`HTTP ${res.status} ${path}`);
+        console.log(`启用：${s.enabled}  文档：${s.path}`);
+        console.log(`来源：${s.live} 启用 / ${s.retired} 停用（上限 ${s.maxSources}，单分类 ${s.maxPerCategory}）`);
+        console.log(`探索：每 ${s.exploreEveryDays} 天 ${s.explorePerRun} 条，上次 ${s.lastExploreDate || '—'}（共 ${s.exploreRuns} 次）`);
+        console.log(`维护：每 ${s.maintainEveryDays} 天，上次 ${s.lastMaintainDate || '—'}（共 ${s.maintainRuns} 次）`);
+        console.log(`该跑了吗：${JSON.stringify(s.overdue)}`);
+        for (const c of s.categories) console.log(`  · ${c.name}: ${c.live}${c.retired ? ` (+${c.retired} 停用)` : ''}`);
+        return;
+      } catch { /* 落到默认输出 */ }
+    }
     console.log(`HTTP ${res.status} ${path}\n${txt.slice(0, 1500)}`);
   } catch (e) {
     console.log(`ERR ${path}: ${e.message}`);
