@@ -52,6 +52,7 @@ const ROLE_OVERRIDES_FILE = path.join(STATE_DIR, 'role-overrides.json');
 const SLANG_FILE = path.join(STATE_DIR, 'slang.json');
 const SLANG_SESSION_FILE = path.join(STATE_DIR, 'slang-session.json');
 const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
+const DAILY_DIGEST_FILE = path.join(STATE_DIR, 'daily-digest.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
@@ -177,6 +178,25 @@ function listRoles() {
   }
 }
 
+// 角色文件解析：优先取 roles/<角色>.md（顶层 = 普通角色，列表可见）；
+// 找不到时在 roles 的子目录里查找（如 roles/adult/<角色>.md：成人角色藏子目录，
+// 列表不显示但 /role 切换与角色注入都能命中）。
+function resolveRoleFile(role) {
+  const safe = String(role ?? '').trim();
+  const top = path.join(ROOT, 'roles', safe + '.md');
+  if (!safe) return top;
+  if (fs.existsSync(top)) return top;
+  try {
+    for (const sub of fs.readdirSync(path.join(ROOT, 'roles'), { withFileTypes: true })) {
+      if (sub.isDirectory()) {
+        const p = path.join(ROOT, 'roles', sub.name, safe + '.md');
+        if (fs.existsSync(p)) return p;
+      }
+    }
+  } catch {}
+  return top;
+}
+
 // 回复审计：agent 回复若命中以下特征（本机路径/凭据），硬性拦截不发送。
 // 宁可误拦，不可泄露。
 // 社交模式“静默标记”：模型输出该标记时，桥接不把内容发到 QQ。
@@ -199,8 +219,9 @@ const SPACE_SPLIT_HINT = '想分多条消息时用空格分隔；不想分条就
 // 管理员工具会话（owner 私聊）专用分条提示：与 ADMIN_SPACE_SPLIT_HINT 发送侧规则一致，
 // 只有“空格两侧都是汉字”才拆条（中英混排不误拆）；单条超 500 字会按标点硬拆。
 const ADMIN_SPACE_SPLIT_HINT = '【分条规则】你回复里的空格会被当作分条信号：只有空格两侧都是汉字才会拆成两条消息；不想分条就别加空格、用标点连成一句。单条超过 500 字会按标点硬拆。';
-// 管理员工具会话常驻汇报规则：中间过程不手动汇报（实时转发自动发），仅重启成功后用发送工具汇报。
-const OWNER_REPORT_RULES = '【汇报规则】① 中间过程不需要用发送工具汇报，桥接会把你的回复文本实时转发给管理员。② 每次桥接或 DSH 重启完成后，由于重启后自动转发可能不可用，直接用发送工具（mcp__snowluma__qq_send_message，key 传当前会话）向管理员汇报一句重启结果。除重启外，其他过程都不需要主动用工具汇报。';
+// 管理员工具会话不再注入任何“用发送工具汇报”的提示：
+// 管理员会话的助手文本由桥接实时转发 + 回合末兜底投递（见 flushOwnerStepBuffer / flushOwnerTurnFallback），
+// 之前常驻的【汇报规则】会诱导 AI 额外调用 qq_send_message 汇报，造成同一条回复被转发一次、工具再发一次（重复）。
 // 管理员工具会话常驻人格提示：与群聊（v2 唤醒提示里的【当前角色】）一致，
 // 每次给管理员会话投递消息时附带当前人格名 + 查看工具，便于 AI 始终知道自己在扮演谁。
 function ownerPersonaHint(key) {
@@ -311,15 +332,36 @@ function sanitizeRoleName(name) {
   return String(name ?? '').replace(/[^\w\u4e00-\u9fff-]/g, '');
 }
 
-// 管理员 QQ（ownerQQ）规范化：空值=未设置；必须是正整数 QQ 号。
+// 管理员 QQ（ownerQQ）规范化：空值=未设置；接受单个 QQ 号或数组；每项必须是正整数 QQ 号。返回去重数组。
 function normalizeOwnerQQ(value) {
-  if (value === undefined || value === null) return null;
-  const s = String(value).trim();
-  if (!s) return null;
-  if (!/^\d+$/.test(s)) throw new Error('ownerQQ 必须是 QQ 号（正整数）');
-  const n = Number(s);
-  if (!Number.isSafeInteger(n) || n <= 0) throw new Error('ownerQQ 必须是 QQ 号（正整数）');
-  return n;
+  const list = Array.isArray(value)
+    ? value
+    : (value === undefined || value === null || String(value).trim() === '' ? [] : [value]);
+  const out = [];
+  for (const v of list) {
+    const s = String(v).trim();
+    if (!/^\d+$/.test(s)) throw new Error('ownerQQ 必须是 QQ 号（正整数）或由它们组成的数组');
+    const n = Number(s);
+    if (!Number.isSafeInteger(n) || n <= 0) throw new Error('ownerQQ 必须是 QQ 号（正整数）或由它们组成的数组');
+    if (!out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+// ownerQQ 数组视图：内部统一以数组保存（单个也归一成数组）。
+function ownerQQList(ownerQQ) { return Array.isArray(ownerQQ) ? ownerQQ : (ownerQQ ? [ownerQQ] : []); }
+
+// 该 QQ 号是否任一管理员。
+function isOwnerId(id, ownerQQ) { const ids = ownerQQList(ownerQQ); return ids.length > 0 && ids.includes(Number(id)); }
+
+// 该会话 key 是否是任一管理员的私聊（private:<号>）。
+function isOwnerKey(key, ownerQQ) { const ids = ownerQQList(ownerQQ); return ids.some((q) => key === `private:${String(q)}`); }
+
+// 序列化给控制台/状态接口展示：单管理员返回单个数字，多管理员返回数组，未设置返回 null。
+function serializeOwnerQQ(ownerQQ) {
+  const ids = ownerQQList(ownerQQ);
+  if (ids.length === 0) return null;
+  return ids.length === 1 ? ids[0] : ids;
 }
 
 // 白名单/黑名单值规范化：只接受字符串或数字数组，非数组按空列表处理（fail-closed 语义由调用方决定）。
@@ -515,6 +557,22 @@ function loadConfig() {
         idleThresholdMs: 15 * 60 * 1000,
         probability: 0.3
       },
+      // 管理员每日早报（科研论文摘要 + 科技巨头动向）：桥接只负责到点投递一条"早报任务"
+      // 提示，采集由 AI 用只读浏览器工具完成（不抓取、不存任何账号凭据）。
+      // enabled:false 即完全关闭（不投递、不调度）。
+      dailyDigest: {
+        enabled: false,
+        time: '08:00',          // 本地时间 HH:MM
+        checkIntervalMs: 60000, // 时间检测周期（秒级轮询，不依赖长定时器）
+        catchUpMinutes: 180,    // 桥接/电脑当时不在线时，错过多久内仍补跑（0=不补跑）
+        windowHours: 24,        // 只整理最近多少小时内的新内容
+        maxPapers: 5,           // 论文条数上限
+        maxNews: 6,             // 科技动向条数上限
+        maxChars: 1800,         // 发到 QQ 的正文长度上限
+        saveToFile: false,      // 是否另外把完整版存成本地 Markdown（默认 false：只发 QQ 文本）
+        topics: '',             // 关注方向（逗号/顿号分隔，留空=用默认清单）
+        promptHint: ''          // 额外追加到早报提示里的要求
+      },
       feedback: {
         maxLength: 500,
         notifyOwnerOnError: false
@@ -585,6 +643,23 @@ function loadConfig() {
       maxRemarkChars: 20,
       ...((cfg.socialV2?.sticker?.collect) ?? {})
     }
+  };
+
+  // socialV2.dailyDigest 深度合并：外层 spread 会把整段替换成配置里的残缺对象，
+  // 这里再补一次默认值，保证新增字段（time/catchUpMinutes 等）始终有默认。
+  cfg.socialV2.dailyDigest = {
+    enabled: false,
+    time: '08:00',
+    checkIntervalMs: 60000,
+    catchUpMinutes: 180,
+    windowHours: 24,
+    maxPapers: 5,
+    maxNews: 6,
+    maxChars: 1800,
+    saveToFile: false,
+    topics: '',
+    promptHint: '',
+    ...(cfg.socialV2?.dailyDigest ?? {})
   };
 
   return cfg;
@@ -859,6 +934,12 @@ async function main() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   acquireLock();
   loadState();
+
+  // 每日早报的定时器与持久化状态：声明必须放在 main() 靠前位置。
+  // checkDsh() 在下方启动后可能早于第 7900 行的 let 初始化就回调到 reserved2 分支，
+  // 若状态声明留在原处会触发 TDZ（ReferenceError），因此提前声明。
+  let dailyDigestTimer = null;
+  let dailyDigestState = { lastRunDate: '', lastRunAt: 0, lastReason: '', lastManualAt: 0, history: [] };
 
   // 普通 QQ 表情（face）自动识别：把 [表情<id>] 解析成 [表情:名字]（如 475 -> [表情:/干饭]）。
   // 查的是 SnowLuma 自带的 sys-face-catalog.json，纯本地同步读取，找不到就回退成原样。
@@ -1646,7 +1727,7 @@ async function main() {
   function modePreset(key, mode, cfg) {
     // 管理员私聊会话：若开启 dsh.ownerTools，则使用带完整本地工具（shell/文件/网络）的 qq-admin 预设。
     // 这是管理员专用能力：只有 ownerQQ 的私聊会话解锁工具，其他会话保持 qq-chat-v2 锁死（无本地工具 + 执行期白名单）。
-    if (cfg.dsh?.ownerTools === true && key === `private:${String(cfg.ownerQQ ?? '')}`) {
+    if (cfg.dsh?.ownerTools === true && isOwnerKey(key, cfg.ownerQQ)) {
       return 'qq-admin';
     }
     // 二代仿真模式优先使用 socialV2.agentPreset；未配置时回退到默认聊天预设
@@ -1656,7 +1737,7 @@ async function main() {
 
   /** 是否管理员私聊「工具会话」：ownerTools 开启时，管理员私聊解锁完整本地工具（qq-admin 预设 + 直接问答）。 */
   function isOwnerToolsKey(key) {
-    return cfg.dsh?.ownerTools === true && key === `private:${String(cfg.ownerQQ ?? '')}`;
+    return cfg.dsh?.ownerTools === true && isOwnerKey(key, cfg.ownerQQ);
   }
 
   /** 判断一个会话 key 是否仍被当前模式/白名单允许（供唤醒调度与 HTTP 路由共用）。 */
@@ -1738,7 +1819,7 @@ async function main() {
         dshReady = true;
         lastMode = currentMode;
         log(`DSH 已就绪（模式: ${modeLabel(currentMode)}）`);
-        // 桥接/DSH 重启完成：向管理员投递系统通知，触发 AI 按【汇报规则】汇报
+        // 桥接/DSH 重启完成：向管理员投递系统通知，触发 AI 用普通回复汇报（自动转发）
         notifyOwnerReady();
         if (currentMode === 'reserved2') {
           // 首次确定模式为 reserved2 后再恢复持久化的有限睡眠定时器，
@@ -1749,6 +1830,9 @@ async function main() {
           }
           // 管理员偶发主动搭话：此时 currentMode 已确认 reserved2，才可调度（否则会被模式守卫拦截）
           scheduleOwnerProactive();
+          // 每日早报：同样等模式确认后再启动时间检测（等待 DSH 就绪后才会有实际投递）
+          loadDailyDigestState();
+          scheduleDailyDigest();
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
         }
         try { await flushQueue(); } catch (error) { log('补投队列异常:', error?.message ?? error); }
@@ -1770,15 +1854,16 @@ async function main() {
   // 桥接/DSH 重启完成：向管理员（owner）私聊投递系统通知，触发 AI 主动汇报。
   // 只在该进程首次确认 DSH 就绪、或 DSH 从不可用恢复时执行（dshReady false→true 转换）。
   function notifyOwnerReady() {
-    if (!cfg.ownerQQ) return;
-    const ownerKey = `private:${String(cfg.ownerQQ)}`;
-    try {
-      const kind = 'private';
-      const id = Number(cfg.ownerQQ);
-      if (!modeAllowed(ownerKey, kind, id, cfg, currentMode)) return;
-      deliverPrompt(ownerKey, `【系统通知】桥接已完成重启并连接 DSH（当前模式: ${modeLabel(currentMode)}）。请按【汇报规则】向管理员简要汇报本次重启已正常完成。`).catch((error) => log(`重启完成通知投递失败: ${error?.message ?? error}`));
-    } catch (error) {
-      log(`重启完成通知异常: ${error?.message ?? error}`);
+    const owners = ownerQQList(cfg.ownerQQ);
+    if (!owners.length) return;
+    for (const id of owners) {
+      const ownerKey = `private:${String(id)}`;
+      try {
+        if (!modeAllowed(ownerKey, 'private', id, cfg, currentMode)) continue;
+        deliverPrompt(ownerKey, `【系统通知】桥接已完成重启并连接 DSH（当前模式: ${modeLabel(currentMode)}）。请直接用普通回复文本向管理员简要汇报本次重启已正常完成，不需要调用任何 QQ 发送工具（桥接会自动转发你的回复）。`).catch((error) => log(`重启完成通知投递失败: ${error?.message ?? error}`));
+      } catch (error) {
+        log(`重启完成通知异常: ${error?.message ?? error}`);
+      }
     }
   }
 
@@ -1949,7 +2034,7 @@ async function main() {
             role: rs.role ?? null,
             roleMode: rs.mode ?? 'active',
             dshReady,
-            ownerQQ: cfg.ownerQQ ?? null,
+            ownerQQ: serializeOwnerQQ(cfg.ownerQQ),
             allowGroups: cfg.allow?.groups ?? [],
             allowPrivate: cfg.allow?.private ?? [],
             socialV2Paused: socialV2.paused,
@@ -1992,7 +2077,7 @@ async function main() {
           const rs = readRoleState();
           if (body.role && typeof body.role === 'string') {
             const name = sanitizeRoleName(body.role);
-            if (!fs.existsSync(path.join(ROOT, 'roles', name + '.md'))) {
+            if (!fs.existsSync(resolveRoleFile(name))) {
               sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
               return;
             }
@@ -2295,7 +2380,7 @@ async function main() {
         if (req.method === 'GET' && url.pathname === '/api/sessions') {
           const list = [];
           for (const [key, sessionId] of Object.entries(state.sessions)) {
-            list.push({ key, sessionId, owner: key === `private:${String(cfg.ownerQQ ?? '')}` });
+            list.push({ key, sessionId, owner: isOwnerKey(key, cfg.ownerQQ) });
           }
           sendJson({ sessions: list });
           return;
@@ -2317,7 +2402,7 @@ async function main() {
         }
         // ── 白名单可视化编辑（写 config.json + 热更新内存） ───────────────────
         if (req.method === 'GET' && url.pathname === '/api/whitelist') {
-          sendJson({ allow: cfg.allow ?? { private: [], groups: [] }, deny: cfg.deny ?? { private: [], groups: [] }, ownerQQ: cfg.ownerQQ ?? null });
+          sendJson({ allow: cfg.allow ?? { private: [], groups: [] }, deny: cfg.deny ?? { private: [], groups: [] }, ownerQQ: serializeOwnerQQ(cfg.ownerQQ) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/whitelist') {
@@ -2334,8 +2419,8 @@ async function main() {
             private: toNum(body.deny?.private) ?? (file.deny?.private ?? []),
             groups: toNum(body.deny?.groups) ?? (file.deny?.groups ?? [])
           };
-          // 管理员 QQ 可在控制台输入；空值=清除管理员（fail-closed），非法值拒绝写入。
-          let ownerQQ = cfg.ownerQQ ?? null;
+          // 管理员 QQ 可在控制台输入（单个号或数组，如 [1471336506, 2991564258]）；空值=清除管理员（fail-closed），非法值拒绝写入。
+          let ownerQQ = cfg.ownerQQ ?? [];
           if (body.ownerQQ !== undefined) {
             try {
               ownerQQ = normalizeOwnerQQ(body.ownerQQ);
@@ -2351,8 +2436,8 @@ async function main() {
           cfg.allow = { private: allow.private, groups: allow.groups };
           cfg.deny = { private: deny.private, groups: deny.groups };
           cfg.ownerQQ = ownerQQ;
-          log(`控制台：白名单已更新（群: ${allow.groups.join(',') || '无'}，私聊: ${allow.private.join(',') || '无'}，管理员: ${ownerQQ ?? '未设置'}）`);
-          sendJson({ ok: true, allow, deny, ownerQQ });
+          log(`控制台：白名单已更新（群: ${allow.groups.join(',') || '无'}，私聊: ${allow.private.join(',') || '无'}，管理员: ${ownerQQ.join(',') || '未设置'}）`);
+          sendJson({ ok: true, allow, deny, ownerQQ: serializeOwnerQQ(ownerQQ) });
           return;
         }
 
@@ -2596,7 +2681,8 @@ async function main() {
           const current = file.socialV2 ?? {};
           const merged = { ...current, ...body };
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
-          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
+          // dailyDigest / ownerProactive 也要并入子对象白名单，避免被上面的 null 清洗逻辑清掉
+          for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'dailyDigest', 'ownerProactive', 'sticker', 'feedback', 'context']) {
             if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
               merged[sub] = current[sub] ?? {};
             }
@@ -2716,6 +2802,25 @@ async function main() {
               }
             }
           }
+          // dailyDigest：每日早报（数值/字符串/布尔归一化；时间必须 HH:MM）
+          if (body.dailyDigest && typeof body.dailyDigest === 'object') {
+            merged.dailyDigest = { ...(current.dailyDigest ?? {}), ...body.dailyDigest };
+            for (const k of ['checkIntervalMs', 'catchUpMinutes', 'windowHours', 'maxPapers', 'maxNews', 'maxChars']) {
+              if (merged.dailyDigest[k] !== undefined) {
+                const n = Number(merged.dailyDigest[k]);
+                merged.dailyDigest[k] = Number.isFinite(n) ? Math.max(0, Math.round(n)) : current.dailyDigest?.[k] ?? 0;
+              }
+            }
+            if (merged.dailyDigest.time !== undefined) {
+              const t = String(merged.dailyDigest.time ?? '').trim();
+              merged.dailyDigest.time = /^\d{1,2}:\d{2}$/.test(t) ? t : (current.dailyDigest?.time ?? '08:00');
+            }
+            if (merged.dailyDigest.enabled !== undefined) merged.dailyDigest.enabled = merged.dailyDigest.enabled === true;
+            if (merged.dailyDigest.saveToFile !== undefined) merged.dailyDigest.saveToFile = merged.dailyDigest.saveToFile === true;
+            for (const k of ['topics', 'promptHint']) {
+              if (merged.dailyDigest[k] !== undefined) merged.dailyDigest[k] = String(merged.dailyDigest[k] ?? '');
+            }
+          }
           if (merged.enabled !== undefined) merged.enabled = merged.enabled === true;
           if (merged.provideRecommendations !== undefined) merged.provideRecommendations = merged.provideRecommendations === true;
           if (merged.agentPreset !== undefined) merged.agentPreset = String(merged.agentPreset ?? '');
@@ -2735,7 +2840,37 @@ async function main() {
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
           if (wakeDefaultChanged) refreshAllDefaultWakeConfigsV2();
           log('控制台：二代仿真配置已更新');
+          // 早报配置变化 → 重启检测循环（改时间/开关后立即生效，不必重启桥接）
+          if (body.dailyDigest && typeof body.dailyDigest === 'object') {
+            stopDailyDigest();
+            scheduleDailyDigest();
+            log(`控制台：每日早报配置已更新（enabled=${cfg.socialV2?.dailyDigest?.enabled === true}，time=${cfg.socialV2?.dailyDigest?.time ?? '08:00'}）`);
+          }
           sendJson({ ok: true, config: cfg.socialV2 });
+          return;
+        }
+        // ── 每日早报：查看状态 / 立即手动跑一次 ──────────────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/daily-digest') {
+          const p = cfg.socialV2?.dailyDigest ?? {};
+          const nextAt = p.enabled === true ? dailyDigestNextAt() : 0;
+          sendJson({
+            ok: true,
+            config: p,
+            state: {
+              lastRunDate: dailyDigestState.lastRunDate,
+              lastRunAt: dailyDigestState.lastRunAt,
+              lastReason: dailyDigestState.lastReason,
+              lastManualAt: dailyDigestState.lastManualAt,
+              history: dailyDigestState.history
+            },
+            nextRunAt: nextAt,
+            nextRunLocal: nextAt ? new Date(nextAt).toLocaleString('zh-CN') : ''
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/daily-digest/run') {
+          const ok = await tryDailyDigest('manual');
+          sendJson({ ok, message: ok ? '已投递早报任务' : '未投递（未启用 / DSH 未就绪 / 无管理员会话）' });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
@@ -4127,8 +4262,8 @@ async function main() {
           appendFeedbackEntry({ id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8), key, level, message, time: new Date().toISOString() });
           log(`[reserved2] AI 反馈 (${key}) [${level}]: ${message.slice(0, 80)}`);
           appendActivity(`${key} [reserved2] AI 反馈 [${level}]：${message.slice(0, 80)}`);
-          if (cfg.socialV2?.feedback?.notifyOwnerOnError && level === 'error' && cfg.ownerQQ) {
-            log(`[reserved2] 错误级反馈，可通知 owner ${cfg.ownerQQ}（当前仅记录日志）`);
+          if (cfg.socialV2?.feedback?.notifyOwnerOnError && level === 'error' && ownerQQList(cfg.ownerQQ).length) {
+            log(`[reserved2] 错误级反馈，可通知 owner ${ownerQQList(cfg.ownerQQ).join(',')}（当前仅记录日志）`);
           }
           sendJson({ ok: true, key, level, message });
           return;
@@ -5550,7 +5685,7 @@ async function main() {
   // 静默模式：除 owner 私聊外，不发送任何在途 AI 回复。
   function shouldBlockSilentReply(key) {
     const roleState = readRoleState();
-    return roleState.mode === 'silent' && key !== `private:${String(cfg.ownerQQ ?? '')}`;
+    return roleState.mode === 'silent' && !isOwnerKey(key, cfg.ownerQQ);
   }
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
@@ -6663,7 +6798,7 @@ async function main() {
     try {
       const role = resolvedRoleFor(key);
       if (!role) return '';
-      const roleFile = path.join(ROOT, 'roles', role + '.md');
+      const roleFile = resolveRoleFile(role);
       if (!fs.existsSync(roleFile)) return '';
       const stateStat = fs.statSync(roleStateFileFor(key));
       const roleStat = fs.statSync(roleFile);
@@ -6683,7 +6818,7 @@ async function main() {
     try {
       const role = resolvedRoleFor(key);
       if (!role) return '';
-      const roleFile = path.join(ROOT, 'roles', role + '.md');
+      const roleFile = resolveRoleFile(role);
       if (!fs.existsSync(roleFile)) return '';
       const stateStat = fs.statSync(roleStateFileFor(key));
       const roleStat = fs.statSync(roleFile);
@@ -7038,7 +7173,7 @@ async function main() {
       tail: String(plainContent ?? textContent).slice(-200),
       quoteTargetIsSelf: !!quoteTargetIsSelf,
       isOwner: !!isOwner,
-      ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
+      ownerLabel: isOwner ? `管理员（ownerQQ ${ownerQQList(cfg.ownerQQ).join(',')}）` : '',
       isSelf: false,
       media: safeMedia,
       hasMedia: safeMedia.length > 0,
@@ -7086,7 +7221,7 @@ async function main() {
       kind: 'poke',
       quoteTargetIsSelf: !!targetIsSelf,
       isOwner: !!isOwner,
-      ownerLabel: isOwner ? `管理员（ownerQQ ${cfg.ownerQQ ?? ''}）` : '',
+      ownerLabel: isOwner ? `管理员（ownerQQ ${ownerQQList(cfg.ownerQQ).join(',')}）` : '',
       isSelf: false,
       media: [],
       hasMedia: false,
@@ -7693,7 +7828,8 @@ async function main() {
   // ── 管理员工具会话：偶发主动搭话 ─────────────────────────────────────
   let ownerProactiveTimer = null;
   function ownerProactiveKey() {
-    return cfg.ownerQQ ? convKey('private', cfg.ownerQQ) : null;
+    const owners = ownerQQList(cfg.ownerQQ);
+    return owners.length ? convKey('private', owners[0]) : null;
   }
   function ownerProactivePromptText() {
     const hint = cfg.socialV2?.ownerProactive?.promptHint
@@ -7754,6 +7890,188 @@ async function main() {
     } catch (error) {
       log('[reserved2] 管理员主动搭话异常:', error?.message ?? error);
     }
+  }
+
+  // ── 管理员每日早报（科研论文摘要 + 科技巨头动向）─────────────────────────
+  // 设计：桥接只负责"到点投递一条早报任务提示"，真正的采集与撰写交给管理员会话里的 AI
+  // （用只读浏览器工具抓公开页面）。桥接不抓取、不登录、不保存任何账号密码。
+  // 开关：config.json → socialV2.dailyDigest.enabled。
+  // 定时器与状态变量已在 main() 顶部声明（避免 checkDsh 早回调时触发 TDZ）。
+
+  function loadDailyDigestState() {
+    const raw = readJsonSafe(DAILY_DIGEST_FILE, null);
+    if (raw && typeof raw === 'object') {
+      dailyDigestState = {
+        lastRunDate: String(raw.lastRunDate ?? ''),
+        lastRunAt: Number(raw.lastRunAt) || 0,
+        lastReason: String(raw.lastReason ?? ''),
+        lastManualAt: Number(raw.lastManualAt) || 0,
+        history: Array.isArray(raw.history) ? raw.history.slice(-30) : []
+      };
+    }
+  }
+  function saveDailyDigestState() {
+    try { atomicWriteJson(DAILY_DIGEST_FILE, dailyDigestState); } catch (error) { log('[早报] 状态写入失败:', error?.message ?? error); }
+  }
+  // 本地日期字符串（YYYY-MM-DD），用于"每天只跑一次"的判定。
+  function localDateStr(ts = Date.now()) {
+    const d = new Date(ts);
+    const p2 = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+  }
+  function dailyDigestClock() {
+    const p = cfg.socialV2?.dailyDigest ?? {};
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(p.time ?? '08:00').trim());
+    const hh = Math.min(23, Math.max(0, Number(m?.[1] ?? 8)));
+    const mm = Math.min(59, Math.max(0, Number(m?.[2] ?? 0)));
+    return { hh, mm };
+  }
+  // 今天该触发的时刻（HH:MM 落在今天的本地时间点）。
+  function dailyDigestTodayAt(now = Date.now()) {
+    const { hh, mm } = dailyDigestClock();
+    const d = new Date(now);
+    d.setHours(hh, mm, 0, 0);
+    return d.getTime();
+  }
+  // 最近一次"本该触发"的时刻（用于显示与补跑判定）。
+  function dailyDigestLastAt(now = Date.now()) {
+    const today = dailyDigestTodayAt(now);
+    if (today <= now) return today;
+    return today - 24 * 60 * 60 * 1000;
+  }
+  // 下一次将触发的时刻（仅用于状态展示）。
+  function dailyDigestNextAt(now = Date.now()) {
+    const today = dailyDigestTodayAt(now);
+    if (today > now) return today;
+    return today + 24 * 60 * 60 * 1000;
+  }
+  function dailyDigestPromptText() {
+    const p = cfg.socialV2?.dailyDigest ?? {};
+    const now = new Date();
+    const weekday = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][now.getDay()];
+    const windowHours = Math.max(1, Number(p.windowHours) || 24);
+    const maxPapers = Math.max(1, Number(p.maxPapers) || 5);
+    const maxNews = Math.max(1, Number(p.maxNews) || 6);
+    const maxChars = Math.max(200, Number(p.maxChars) || 1200);
+    const topics = String(p.topics ?? '').trim()
+      || '大模型/多模态/Agent/推理与训练效率/机器人，以及 OpenAI、Google DeepMind、Anthropic、Meta、Microsoft、NVIDIA、Apple、Amazon、xAI 与中文科技圈';
+    const saveDir = cfg.dsh?.ownerWorkspace ? String(cfg.dsh.ownerWorkspace) : '';
+    const savePath = (p.saveToFile !== false && saveDir) ? `${saveDir}\\早报\\${localDateStr(now.getTime())}.md` : '';
+    const extra = String(p.promptHint ?? '').trim();
+    const lines = [
+      `【每日早报】现在是 ${localDateStr(now.getTime())} ${weekday} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}，请给管理员做今天的早报。`,
+      `范围：只整理最近 ${windowHours} 小时内的新内容。`,
+      `① 科研论文：最多 ${maxPapers} 篇，每篇给「标题 / 来源（arXiv 等）/ 一句话结论 / 为什么值得看 / 链接」。`,
+      `② 科技巨头动向：最多 ${maxNews} 条，每条给「谁做了什么（一句话事实）/ 意味着什么 / 链接」。`,
+      `关注方向：${topics}`,
+      '采集要求（只读，不要登录、不要输入任何账号密码）：',
+      '· 用浏览器工具打开公开只读页面采集，例如 arXiv 的 cs.AI / cs.CL / cs.LG recent 列表、Hacker News、Techmeme 等科技新闻聚合站，以及厂商官方博客。',
+      '· 重点看"今天/最近一两天"的新条目，别拿旧闻充数；同一事件只保留一条，优先一手来源（论文原文、官方博客）。',
+      '· 某个站点打不开、需要登录或被反爬拦住时，换一个来源即可，不要为了拿数据去登录或输入凭据。',
+      '· 宁可少写几条也不要编造：所有条目必须来自你这次实际打开过的页面；确实采集不到就直接说明"今天没能采集到"，并写清卡在哪里。',
+    ];
+    if (savePath) {
+      lines.push(`输出（两步都要做）：`);
+      lines.push(`1. 完整版写成 Markdown 文件保存到 ${savePath}（目录不存在就创建），包含所有条目与链接。`);
+      lines.push(`2. 最后给管理员一段适合 QQ 阅读的精简版，不超过 ${maxChars} 字：不用 Markdown 标题语法，条目用「1. 2. 3.」编号，直接输出正文即可（桥接会自动转发，不要调用任何发送工具）。`);
+    } else {
+      lines.push(`输出：只输出一段适合 QQ 阅读的正文，不超过 ${maxChars} 字。不要写本地文件、不要用 Markdown 标题语法（#、**、表格都不要），条目用「1. 2. 3.」编号，每条尽量给「标题/来源/一句话结论/链接」；直接输出正文即可（桥接会自动转发，不要调用任何发送工具）。`);
+    }
+    if (extra) lines.push(`补充要求：${extra}`);
+    lines.push('', ADMIN_SPACE_SPLIT_HINT, ownerPersonaHint(ownerProactiveKey()));
+    return lines.join('\n');
+  }
+  // 立即执行一次早报投递。reason: 'scheduled' | 'catch-up' | 'manual'
+  async function tryDailyDigest(reason = 'scheduled') {
+    try {
+      const p = cfg.socialV2?.dailyDigest ?? {};
+      if (p.enabled !== true) { log('[早报] 未启用（socialV2.dailyDigest.enabled=false），跳过'); return false; }
+      const key = ownerProactiveKey();
+      if (!key || !isOwnerToolsKey(key)) { log('[早报] 没有可用的管理员工具会话，跳过'); return false; }
+      if (!dshReady) { log('[早报] DSH 未就绪，跳过'); return false; }
+      if (currentMode !== 'reserved2') { log(`[早报] 当前模式非 reserved2（${currentMode}），跳过`); return false; }
+      const today = localDateStr();
+      if (reason !== 'manual' && dailyDigestState.lastRunDate === today) {
+        log('[早报] 今天已经跑过，跳过');
+        return false;
+      }
+      await deliverPrompt(key, dailyDigestPromptText());
+      const at = Date.now();
+      const now = at;
+      dailyDigestState.lastReason = reason;
+      if (reason === 'manual') {
+        dailyDigestState.lastManualAt = at;
+        // 手动执行时：若今天的触发时刻已经过去，就把今天标记为已完成，
+        // 免得下一次检测（≤60s 后）再自动投递一份重复的早报。
+        // 若还没到今天的触发时刻（例如 07:00 手动试跑），则不标记，8:00 照常自动跑。
+        if (now >= dailyDigestTodayAt(now)) {
+          dailyDigestState.lastRunDate = today;
+          dailyDigestState.lastRunAt = at;
+          dailyDigestState.history = [...dailyDigestState.history, { date: today, at, reason }].slice(-30);
+        }
+      } else {
+        dailyDigestState.lastRunDate = today;
+        dailyDigestState.lastRunAt = at;
+        dailyDigestState.history = [...dailyDigestState.history, { date: today, at, reason }].slice(-30);
+      }
+      saveDailyDigestState();
+      log(`[早报] 已向管理员投递早报任务（${reason}）`);
+      appendActivity(`${key} [早报] 已投递每日早报任务（${reason}）`);
+      return true;
+    } catch (error) {
+      log('[早报] 投递异常:', error?.message ?? error);
+      return false;
+    }
+  }
+  // 周期性时间检测（默认每 60 秒一次），而不是"睡到 8 点的一次性长定时器"。
+  // 好处：① 电脑休眠/挂起、时钟漂移、系统时间被改都不会让触发点丢失；
+  //       ② 桥接重启后立刻恢复检测；③ 触发逻辑只依赖"今天是否已跑过"这一持久化标记，
+  //       ④ 幂等：同一天内重复检测不会重复投递。
+  async function dailyDigestTick() {
+    const p = cfg.socialV2?.dailyDigest ?? {};
+    if (p.enabled !== true) return;
+    const now = Date.now();
+    if (!dshReady || currentMode !== 'reserved2') return;
+    const today = localDateStr(now);
+    if (dailyDigestState.lastRunDate === today) return;   // 今天已跑过
+    const dueAt = dailyDigestTodayAt(now);
+    if (now < dueAt) return;                              // 还没到今天的触发时刻
+    // 轮询间隔内的迟到属于"正常到点触发"（例如 60s 轮询在 08:00:37 才检测到），
+    // 不算补跑；否则 catchUpMinutes=0 时会永远错过。宽限 = max(一个检测周期, 60s)。
+    const checkMs = Math.max(10 * 1000, Number(p.checkIntervalMs) || 60000);
+    const graceMs = Math.max(checkMs, 60 * 1000);
+    const lateMs = now - dueAt;
+    const catchUpMs = Math.max(0, Number(p.catchUpMinutes) || 0) * 60 * 1000;
+    if (lateMs <= graceMs) {
+      await tryDailyDigest('scheduled');
+    } else if (catchUpMs > 0 && lateMs <= catchUpMs) {
+      await tryDailyDigest('catch-up');
+    } else {
+      // 错过太久（超过补跑窗口）→ 记下今天已处理，避免晚些时候突然补发
+      dailyDigestState.lastRunDate = today;
+      saveDailyDigestState();
+      log(`[早报] 今天的触发点已过去 ${Math.round(lateMs / 60000)} 分钟，超出补跑窗口，跳过（明天照常）`);
+    }
+  }
+  // 启动周期检测（幂等：已在运行则不重复创建）。
+  function scheduleDailyDigest() {
+    const p = cfg.socialV2?.dailyDigest ?? {};
+    if (p.enabled !== true) return;
+    if (dailyDigestTimer) return;
+    const checkMs = Math.max(10 * 1000, Number(p.checkIntervalMs) || 60000);
+    dailyDigestTimer = setInterval(() => {
+      void dailyDigestTick().catch((error) => log('[早报] 检测异常:', error?.message ?? error));
+    }, checkMs);
+    dailyDigestTimer.unref?.();
+    // 启动后立刻检测一次（例如桥接 08:30 才起来，仍在补跑窗口内就马上补今天的早报）
+    void dailyDigestTick().catch((error) => log('[早报] 首次检测异常:', error?.message ?? error));
+    log(`[早报] 已启动时间检测（每 ${Math.round(checkMs / 1000)}s 一次），触发时刻 ${String(p.time ?? '08:00')}，补跑窗口 ${p.catchUpMinutes ?? 180} 分钟`);
+  }
+  function stopDailyDigest() {
+    if (!dailyDigestTimer) return;
+    clearInterval(dailyDigestTimer);
+    dailyDigestTimer = null;
+    log('[早报] 已停止时间检测');
   }
 
   function clearSocialV2Timers(key) {
@@ -7842,7 +8160,7 @@ async function main() {
     // 因此必须先解析 quoteTargetIsSelf 再做空文本过滤，避免“只引用不附文”被漏掉。
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    const isOwner = isOwnerId(event.user_id, cfg.ownerQQ);
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -7872,12 +8190,27 @@ async function main() {
         await sendToQQ(key, '管理命令仅管理员可用。');
         return;
       }
-      if (plainContent === '/reset' || plainContent === '/new') {
-        const old = state.sessions[key];
+      if (plainContent === '/reset' || plainContent === '/new' || /^\/?(?:reset|new)\s+/.test(plainContent)) {
+        // 支持带目标：/reset 2991564258、/reset private:2991564258、/reset group:1106664281、/reset 私聊2991564258
+        const arg = plainContent.replace(/^\/(?:reset|new)\s*/, '').trim();
+        let targetKey = key;
+        if (arg) {
+          const bare = arg.replace(/\D/g, '');
+          if (/^(?:private|group):/.test(arg)) targetKey = arg;
+          else if (/^私聊/.test(arg)) targetKey = `private:${bare}`;
+          else if (/^群/.test(arg)) targetKey = `group:${bare}`;
+          else if (state.sessions[`private:${bare}`]) targetKey = `private:${bare}`;
+          else if (state.sessions[`group:${bare}`]) targetKey = `group:${bare}`;
+          else {
+            await sendToQQ(key, `未找到会话「${arg}」。可重置：${Object.keys(state.sessions).join('、')}`);
+            return;
+          }
+        }
+        const old = state.sessions[targetKey];
         if (old) {
           sessionEpoch++;
-          delete state.sessions[key];
-          if (state.roleLoaded) delete state.roleLoaded[key]; // 新会话需重新注入角色卡
+          delete state.sessions[targetKey];
+          if (state.roleLoaded) delete state.roleLoaded[targetKey]; // 新会话需重新注入角色卡
           reverse.delete(old);
           collectors.delete(old);
           sendToolSucceededSessions.delete(old);
@@ -7889,37 +8222,41 @@ async function main() {
           toolCallNames.delete(old);
           social.silentTurns.delete(old);
           social.exitingSessions.delete(old);
-          const pe = pending.get(key);
+          const pe = pending.get(targetKey);
           if (pe) {
             clearTimeout(pe.timer);
             cancelPendingEntry(pe).catch(() => {});
           }
-          pending.delete(key);
-          queued.delete(key);
-          queuedHintAt.delete(key);
-          sessionPromises.delete(key);
-          drainPromptQueue(key, '会话已重置');
-          social.recentMessages.delete(key);
-          messageMediaStore.delete(key);
-          social.pendingSummaries.delete(key);
-          social.states.delete(key);
-          social.silentContext.delete(key);
-          slangWindows.delete(key);
-          slangExtractionCooldowns.delete(key);
-          slangSubmitTimes.delete(key);
-          cancelSocialTimers(key);
-          clearSocialV2Timers(key);
-          pendingWakeKeys.delete(key);
-          wakeConfigUpdatedKeys.delete(key);
-          markReadCalledKeys.delete(key);
-          wakeConfigMissCount.delete(key);
-          const removedV2 = socialV2.conversations.get(key);
+          pending.delete(targetKey);
+          queued.delete(targetKey);
+          queuedHintAt.delete(targetKey);
+          sessionPromises.delete(targetKey);
+          drainPromptQueue(targetKey, '会话已重置');
+          social.recentMessages.delete(targetKey);
+          messageMediaStore.delete(targetKey);
+          social.pendingSummaries.delete(targetKey);
+          social.states.delete(targetKey);
+          social.silentContext.delete(targetKey);
+          slangWindows.delete(targetKey);
+          slangExtractionCooldowns.delete(targetKey);
+          slangSubmitTimes.delete(targetKey);
+          cancelSocialTimers(targetKey);
+          clearSocialV2Timers(targetKey);
+          pendingWakeKeys.delete(targetKey);
+          wakeConfigUpdatedKeys.delete(targetKey);
+          markReadCalledKeys.delete(targetKey);
+          wakeConfigMissCount.delete(targetKey);
+          const removedV2 = socialV2.conversations.get(targetKey);
           if (removedV2?.agentToken) KNOWN_AGENT_TOKENS.delete(removedV2.agentToken);
-          socialV2.conversations.delete(key);
-          seenForwardIds.delete(key);
+          socialV2.conversations.delete(targetKey);
+          seenForwardIds.delete(targetKey);
           saveSocialV2State();
           saveState();
-          await sendToQQ(key, '已重置会话，下次消息将开新上下文');
+          try { await api.workspace.archiveSession({ sessionId: old }); } catch {}
+          log(`管理员命令：重置会话 ${targetKey}（旧会话 ${old} 已归档）`);
+          await sendToQQ(key, arg ? `已重置 ${targetKey}，下次消息将开新上下文` : '已重置会话，下次消息将开新上下文');
+        } else {
+          await sendToQQ(key, arg ? `会话 ${targetKey} 未创建，无需重置。` : '当前会话未创建，无需重置。');
         }
         return;
       }
@@ -7936,7 +8273,7 @@ async function main() {
           saveState();
           await sendToQQ(key, '已清除本会话角色，恢复默认人格。');
         } else {
-          const roleFile = path.join(ROOT, 'roles', name + '.md');
+          const roleFile = resolveRoleFile(name);
           if (!fs.existsSync(roleFile)) {
             await sendToQQ(key, `角色「${name}」不存在。角色文件放 qq-bridge/roles/ 目录。`);
           } else {
@@ -7968,7 +8305,7 @@ async function main() {
     // 只有管理员（ownerQQ）触发，群友由上方「控制类话语」拦截。
     if (isOwner && !plainContent.startsWith('/')) {
       const roleText = plainContent.trim();
-      const roleExists = (name) => fs.existsSync(path.join(ROOT, 'roles', name + '.md'));
+      const roleExists = (name) => fs.existsSync(resolveRoleFile(name));
       // 重启 DSH：直接执行（不经 AI），约 10 秒后恢复。支持「重启dsh / 重启 DSH / 重启 / 重启你 / restart」。
       const restartDshRe = /^(?:重启|restart)\s*(?:dsh|DSH|服务|我|你)?[！!。.]?\s*$/;
       if (restartDshRe.test(roleText)) {
@@ -7985,6 +8322,38 @@ async function main() {
         setTimeout(scheduleDshShutdown, 500);
         return;
       }
+      // 每日早报：立即手动跑一次（不受"今天已跑过"限制）。支持「早报 / 今日早报 / 跑早报 / 来份早报」。
+      const digestNowRe = /^(?:今日|今天)?\s*(?:早报|日报|晨报|论文早报|科技早报)\s*[！!。.]?\s*$/;
+      if (digestNowRe.test(roleText)) {
+        const p = cfg.socialV2?.dailyDigest ?? {};
+        if (p.enabled !== true) {
+          await sendToQQ(key, `每日早报当前是关闭状态（config.json → socialV2.dailyDigest.enabled=false）。要现在跑一次的话我可以直接开，或者你用控制台接口 POST /api/socialV2/daily-digest/run。`);
+          return;
+        }
+        const started = await tryDailyDigest('manual');
+        await sendToQQ(key, started
+          ? '好的，马上给你整理今天的早报（论文摘要 + 科技动向），采集完我直接发过来…'
+          : '现在没法跑早报（DSH 未就绪或没有可用的管理员会话），稍后再试一次。');
+        return;
+      }
+      // 早报状态：支持「早报状态 / 早报设置 / 早报时间」
+      const digestStateRe = /^(?:早报|日报|晨报)(?:状态|设置|配置|时间|开关)\s*[！!。.]?\s*$/;
+      if (digestStateRe.test(roleText)) {
+        const p = cfg.socialV2?.dailyDigest ?? {};
+        const nextAt = p.enabled === true ? dailyDigestNextAt() : 0;
+        const lines = [
+          `每日早报：${p.enabled === true ? '已开启' : '已关闭'}`,
+          `时间：每天 ${p.time ?? '08:00'}（本地时间）`,
+          `补跑窗口：${p.catchUpMinutes ?? 180} 分钟（错过这段时间内仍会补发）`,
+          `范围：最近 ${p.windowHours ?? 24} 小时｜论文 ≤${p.maxPapers ?? 5} 篇｜动向 ≤${p.maxNews ?? 6} 条｜QQ 精简版 ≤${p.maxChars ?? 1200} 字`,
+          `关注方向：${String(p.topics ?? '').trim() || '（默认：大模型/多模态/Agent/训练效率/机器人 + 主要科技巨头）'}`,
+          `上次执行：${(dailyDigestState.lastRunAt || dailyDigestState.lastManualAt) ? `${new Date(dailyDigestState.lastRunAt || dailyDigestState.lastManualAt).toLocaleString('zh-CN')}（${dailyDigestState.lastReason || '—'}）` : '（还没有执行过）'}`,
+          nextAt ? `下次：${new Date(nextAt).toLocaleString('zh-CN')}` : '下次：（未调度）',
+          '开关与参数改 config.json → socialV2.dailyDigest（改完立刻生效，不用重启桥接）。'
+        ];
+        await sendToQQ(key, lines.join('\n'));
+        return;
+      }
       // 查看所有可用指令
       const helpRe = /^(?:help|帮助|指令|命令|指令列表|命令列表|查看指令|查看命令|有哪些指令)[！!。.]?\s*$/;
       if (helpRe.test(roleText)) {
@@ -7992,12 +8361,15 @@ async function main() {
           '【管理员可用指令】',
           '· 重启dsh / 重启 — 重启 DSH（约 10 秒恢复，重载插件与 MCP 工具）',
           '· 关闭dsh / 关闭服务 / shutdown — 关闭 DSH（桥接保持，可再「重启dsh」拉起）',
+          '· 早报 — 立即整理一份今日早报（论文摘要 + 科技动向）',
+          '· 早报状态 — 查看早报开关、时间、范围与上次/下次执行时间',
           '· help / 帮助 / 指令 — 查看本帮助',
           '· 查看角色卡 / 查看人格 — 查看可用角色卡与人格配置',
           '· 进入角色扮演 X / 切换角色 X — 设置本会话角色',
           '· 退出角色扮演 / 不演了 / 恢复人格 — 回到默认人格',
           '· 设置默认人格：X — 设置全局默认人格',
           '· 把 group:群号 的人格换成 X — 给指定会话设置角色',
+          '· /reset [目标] — 重置会话：不带参数重置当前会话，带参数重置指定（如 /reset 2991564258）',
           '· /silent、/active — 静默 / 恢复（群友模式）',
           '· /model 等斜杠命令 — 原样交给 DSH 执行',
           '控制台接口：POST /api/restart（重启桥接）、/api/dsh/restart、/api/dsh/shutdown'
@@ -8144,7 +8516,7 @@ async function main() {
         ? `${event.sender?.card || event.sender?.nickname || String(event.user_id)}：${textContent}`
         : textContent)
       + mediaHintFor(key, messageRef, mediaList)
-      + (isOwnerToolsKey(key) ? '\n\n' + ADMIN_SPACE_SPLIT_HINT + '\n' + ownerPersonaHint(key) + '\n' + OWNER_REPORT_RULES : '');
+      + (isOwnerToolsKey(key) ? '\n\n' + ADMIN_SPACE_SPLIT_HINT + '\n' + ownerPersonaHint(key) : '');
 
     appendActivity(`${key} ${isOwner ? '管理员' : '群友'} ${event.sender?.nickname || event.user_id}：${textContent.slice(0, 80)}`);
 

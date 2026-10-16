@@ -34,3 +34,6 @@ config.json
 
 # Image archive library (gitignored per admin request)
 /images/
+
+# Adult-oriented role cards (keep local only, avoid platform risk)
+/roles/private role/

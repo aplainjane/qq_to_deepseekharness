@@ -187,6 +187,19 @@
       "recentLimit": 100,
       "unreadLimit": 30,
       "contextWindow": 20
+    },
+    "dailyDigest": {
+      "enabled": false,
+      "time": "08:00",
+      "checkIntervalMs": 60000,
+      "catchUpMinutes": 180,
+      "windowHours": 24,
+      "maxPapers": 5,
+      "maxNews": 6,
+      "maxChars": 1800,
+      "saveToFile": false,
+      "topics": "",
+      "promptHint": ""
     }
   },
   "startup": {

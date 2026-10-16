@@ -16,6 +16,7 @@
     "test-forward": "node scripts/test-forward.mjs",
     "test-slang": "node scripts/test-slang-learn.mjs",
     "test-stickers": "node scripts/test-stickers.mjs",
+    "test-digest": "node scripts/test-daily-digest.mjs",
     "postinstall": "node scripts/patch-snowluma-sdk.mjs"
   },
   "dependencies": {
