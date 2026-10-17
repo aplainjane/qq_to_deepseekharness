@@ -581,6 +581,8 @@ function loadConfig() {
         windowHours: 24,        // 只整理最近多少小时内的新内容
         maxPapers: 5,           // 论文条数上限
         maxNews: 6,             // 科技动向条数上限
+        dealsSection: true,     // 是否包含「实用情报」板块（免费额度/折扣/额度重置/低价渠道）
+        maxDeals: 4,            // 实用情报条数上限（0 = 不写这个板块）
         maxChars: 1800,         // 发到 QQ 的正文长度上限
         saveToFile: false,      // 是否另外把完整版存成本地 Markdown（默认 false：只发 QQ 文本）
         topics: '',             // 关注方向（逗号/顿号分隔，留空=用默认清单）
@@ -683,6 +685,8 @@ function loadConfig() {
     windowHours: 24,
     maxPapers: 5,
     maxNews: 6,
+    dealsSection: true,
+    maxDeals: 4,
     maxChars: 1800,
     saveToFile: false,
     topics: '',
@@ -2937,6 +2941,24 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/daily-digest/run') {
           const ok = await tryDailyDigest('manual');
           sendJson({ ok, message: ok ? '已投递早报任务' : '未投递（未启用 / DSH 未就绪 / 无管理员会话）' });
+          return;
+        }
+        // 预览早报提示词：只返回文本，不投递、不改任何状态（便于核对改配置后的实际效果）
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/daily-digest/preview') {
+          sendJson({ ok: true, prompt: dailyDigestPromptText() });
+          return;
+        }
+        // 预览信息源库任务提示词：kind=explore|maintain
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/source-library/preview') {
+          const kind = url.searchParams.get('kind') === 'maintain' ? 'maintain' : 'explore';
+          const sl = sourceLibraryCfg();
+          const lib = readSourceLibrary() ?? seedSourceLibrary(emptyLibrary(), localDateStr());
+          const file = sourceLibraryPath();
+          const today = localDateStr();
+          const prompt = kind === 'maintain'
+            ? buildMaintainPrompt({ docPath: file, lib, cfg: sl, today })
+            : buildExplorePrompt({ docPath: file, lib, cfg: sl, today });
+          sendJson({ ok: true, kind, prompt });
           return;
         }
         // ── 信息源库：查看状态 / 手动触发探索或维护 ──────────────────────────
@@ -8033,6 +8055,8 @@ async function main() {
     const windowHours = Math.max(1, Number(p.windowHours) || 24);
     const maxPapers = Math.max(1, Number(p.maxPapers) || 5);
     const maxNews = Math.max(1, Number(p.maxNews) || 6);
+    const maxDeals = Math.max(0, Number(p.maxDeals) || 0);
+    const dealsEnabled = p.dealsSection !== false && maxDeals > 0;
     const maxChars = Math.max(200, Number(p.maxChars) || 1200);
     const topics = String(p.topics ?? '').trim()
       || '大模型/多模态/Agent/推理与训练效率/机器人，以及 OpenAI、Google DeepMind、Anthropic、Meta、Microsoft、NVIDIA、Apple、Amazon、xAI 与中文科技圈';
@@ -8058,6 +8082,9 @@ async function main() {
       `范围：只整理最近 ${windowHours} 小时内的新内容。`,
       `① 科研论文：最多 ${maxPapers} 篇，每篇给「标题 / 来源（arXiv 等）/ 一句话结论 / 为什么值得看 / 链接」。`,
       `② 科技巨头动向：最多 ${maxNews} 条，每条给「谁做了什么（一句话事实）/ 意味着什么 / 链接」。`,
+      ...(dealsEnabled
+        ? [`③ 实用情报（重点板块）：最多 ${maxDeals} 条，每条给「是什么 / 怎么用上 / 截止时间或有效期（有就写）/ 链接」。关注：新出的 AI 免费额度或限时折扣、各家订阅/API 的额度重置与套餐变更、新的低价或替代渠道、学生/教育优惠、值得薅的试用。对管理员有实际用处的优先，没有就少写或不写这条板块。`]
+        : []),
       `关注方向：${topics}`,
       ...srcLines,
       '采集要求（只读，不要登录、不要输入任何账号密码）：',
@@ -8066,6 +8093,18 @@ async function main() {
       '· 某个站点打不开、需要登录或被反爬拦住时，换一个来源即可，不要为了拿数据去登录或输入凭据。',
       '· 宁可少写几条也不要编造：所有条目必须来自你这次实际打开过的页面；确实采集不到就直接说明"今天没能采集到"，并写清卡在哪里。',
     ];
+    if (dealsEnabled) {
+      lines.push(
+        '· ③ 板块的额外要求（这部分最容易出错，务必守住）：',
+        '  - 价格、额度、折扣、有效期必须是你在页面上**实际看到**的，原样引用；不要凭印象或记忆写数字，不要"大概""据说"。',
+        '  - 必须给出来源链接。给不出链接的一律不写。',
+        '  - 区分"官方活动"和"第三方转卖"：官方渠道的信息优先；第三方低价/转让渠道只在确实有信息价值时提一句，并明确标注是第三方、有风险，不要当成推荐。',
+        '  - 不要编造优惠码、邀请码、折扣码或注册链接。',
+        '  - 不要引导管理员违反任何服务的条款（如共享账号、绕过地区限制、滥用试用）。',
+        '  - 只写"现在还能用得上"的：已经结束的活动、过期的优惠券不要写。',
+        '  - 这一板块宁缺毋滥：当天确实没有值得说的，就直接写"今天没看到值得薅的新东西"，不要为了凑数写广告。'
+      );
+    }
     if (savePath) {
       lines.push(`输出（两步都要做）：`);
       lines.push(`1. 完整版写成 Markdown 文件保存到 ${savePath}（目录不存在就创建），包含所有条目与链接。`);

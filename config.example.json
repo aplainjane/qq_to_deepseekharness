@@ -196,6 +196,8 @@
       "windowHours": 24,
       "maxPapers": 5,
       "maxNews": 6,
+      "dealsSection": true,
+      "maxDeals": 4,
       "maxChars": 1800,
       "saveToFile": false,
       "topics": "",

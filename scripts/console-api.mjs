@@ -7,20 +7,33 @@ const path = action === 'dsh-restart' ? '/api/dsh/restart'
   : action === 'restart' ? '/api/restart'
   : action === 'digest' ? '/api/socialV2/daily-digest'
   : action === 'digest-run' ? '/api/socialV2/daily-digest/run'
+  : action === 'digest-preview' ? '/api/socialV2/daily-digest/preview'
   : action === 'sources' ? '/api/socialV2/source-library'
   : action === 'sources-explore' ? '/api/socialV2/source-library/explore'
   : action === 'sources-maintain' ? '/api/socialV2/source-library/maintain'
+  : action === 'sources-preview-explore' ? '/api/socialV2/source-library/preview?kind=explore'
+  : action === 'sources-preview-maintain' ? '/api/socialV2/source-library/preview?kind=maintain'
   : '/api/status';
 const method = (action === 'dsh-restart' || action === 'restart' || action === 'digest-run'
   || action === 'sources-explore' || action === 'sources-maintain') ? 'POST' : 'GET';
 (async () => {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}${path}?token=${encodeURIComponent(token)}`, {
+    const sep = path.includes('?') ? '&' : '?';
+    const res = await fetch(`http://127.0.0.1:${port}${path}${sep}token=${encodeURIComponent(token)}`, {
       method,
       headers: { 'content-type': 'application/json' },
       body: method === 'POST' ? '{}' : undefined
     });
     const txt = await res.text();
+    // 预览类：直接打印提示词正文，便于核对
+    if (action.startsWith('digest-preview') || action.startsWith('sources-preview')) {
+      try {
+        const j = JSON.parse(txt);
+        console.log(`HTTP ${res.status} ${path}`);
+        console.log(j.prompt ?? txt.slice(0, 1500));
+        return;
+      } catch { /* 落到默认输出 */ }
+    }
     // sources 状态是嵌套 JSON，压平一点便于阅读
     if (action === 'sources' && res.ok) {
       try {

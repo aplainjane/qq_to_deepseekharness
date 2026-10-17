@@ -35,9 +35,13 @@ export const DEFAULT_CATEGORIES = Object.freeze([
   '科研机构与实验室',
   '科技新闻聚合',
   '公司与组织（大企业 / 独角兽）',
+  '羊毛与价格情报',
   '中文科技圈',
   '社区与讨论'
 ]);
+
+// 「羊毛与价格情报」分类名（早报的③板块专门从这里取材）。集中放一处，避免各处写死字符串。
+export const DEALS_CATEGORY = '羊毛与价格情报';
 
 function todayStr(ts = Date.now()) {
   const d = new Date(ts);
@@ -333,8 +337,16 @@ export function seedSourceLibrary(lib, today = todayStr()) {
   add('公司与组织（大企业 / 独角兽）', 'Apple Newsroom', 'https://www.apple.com/newsroom/', '官方动态', '');
   add('公司与组织（大企业 / 独角兽）', 'Mistral AI', 'https://mistral.ai/news', '独角兽官方动态', '欧洲头部独角兽');
 
-  add('中文科技圈', '机器之心', 'https://www.jiqizhixin.com/', '中文 AI 报道', '');
+  add('中文科技圈', '机器之心', 'https://www.jiqizhixin.com/', '中文 AI 报道', '部分内容需会员');
   add('中文科技圈', '量子位', 'https://www.qbitai.com/', '中文 AI 报道', '');
+
+  add('羊毛与价格情报', 'OpenRouter 模型列表', 'https://openrouter.ai/models', '免费/折扣模型与价格', '首页常有各家限时折扣横幅；筛选 FREE 与 Discounted 看免费/降价模型');
+  add('羊毛与价格情报', 'Codex / ChatGPT 更新日志', 'https://learn.chatgpt.com/docs/changelog', '额度与套餐变更', '官方 changelog：额度重置、套餐调整、新模型开放都会在这里先写');
+  add('羊毛与价格情报', 'Cursor 更新日志', 'https://cursor.com/changelog', '额度与套餐变更', '官方 changelog，含额度/计费策略调整');
+  add('羊毛与价格情报', 'Gemini API 价格页', 'https://ai.google.dev/gemini-api/docs/pricing', '免费额度与降价', '官方价格页，明确写出免费层级额度与 Batch 半价');
+  add('羊毛与价格情报', 'DeepSeek 价格页', 'https://api-docs.deepseek.com/quick_start/pricing', '价格与优惠', '官方价格页，含错峰折扣时段');
+  add('羊毛与价格情报', 'V2EX 交易节点', 'https://www.v2ex.com/?tab=deals', '低价渠道与转让', '中文圈转让/低价渠道的集中地，注意甄别风险，只作情报不作推荐');
+  add('羊毛与价格情报', 'GitHub Student Developer Pack', 'https://education.github.com/pack', '学生优惠', '学生身份可领的开发者优惠集合（含 Copilot 等）');
 
   add('社区与讨论', 'LMArena 排行榜', 'https://lmarena.ai/leaderboard', '模型评测排名', '看模型口碑与实际排名');
   add('社区与讨论', 'r/MachineLearning', 'https://www.reddit.com/r/MachineLearning/', '研究社区讨论', '');
@@ -397,6 +409,13 @@ export function companyWatchlist(lib, { max = 12 } = {}) {
   return cat.sources.filter((s) => s.status !== SOURCE_STATUS.RETIRED).slice(0, max);
 }
 
+// 「羊毛与价格情报」分类单独取出来，供早报的③板块使用（额度重置、免费额度、折扣、学生优惠等）。
+export function dealsWatchlist(lib, { max = 10 } = {}) {
+  const cat = lib.categories.find((c) => c.name === DEALS_CATEGORY);
+  if (!cat) return [];
+  return cat.sources.filter((s) => s.status !== SOURCE_STATUS.RETIRED).slice(0, max);
+}
+
 function capRulesText(cfg) {
   const rules = [
     `总来源数上限 ${cfg.maxSources} 条（只算启用的；超过就必须先淘汰再新增）`,
@@ -454,6 +473,7 @@ export function buildMaintainPrompt({ docPath, lib, cfg, today = todayStr() }) {
   const stats = libraryStats(lib);
   const violations = capViolations(lib, cfg);
   const companies = companyWatchlist(lib, { max: 15 });
+  const deals = dealsWatchlist(lib, { max: 15 });
   const lines = [
     `【信息源维护】${today}，请给早报的信息源库做一次定期维护。`,
     `信息源库文档：${docPath}`,
@@ -468,8 +488,16 @@ export function buildMaintainPrompt({ docPath, lib, cfg, today = todayStr() }) {
     `5. **大企业与独角兽刷新**：更新「公司与组织（大企业 / 独角兽）」分类——补上最近值得关注的新公司，移除已不再活跃的。当前该分类有 ${companies.length} 条：`,
   ];
   for (const c of companies) lines.push(`   - ${c.name}${c.url ? ` (${c.url})` : ''}`);
+  if (deals.length) {
+    lines.push(
+      `6. **省钱渠道刷新**：更新「${DEALS_CATEGORY}」分类——核实价格页/额度页是否还在、活动是否已结束（结束的把活动内容从备注里去掉，站点本身仍有用就保留），并按「探索」标准补进新的可薅渠道（免费额度、限时折扣、学生优惠、低价替代）。当前该分类有 ${deals.length} 条：`
+    );
+    for (const d of deals) lines.push(`   - ${d.name}${d.url ? ` (${d.url})` : ''}`);
+  } else {
+    lines.push(`6. **省钱渠道**：「${DEALS_CATEGORY}」分类目前是空的，请按「探索」标准建立它（免费额度、限时折扣、额度/套餐变更公告页、学生优惠、低价替代渠道）。`);
+  }
   lines.push(
-    '6. 顺手把这次维护中发现的好的新来源按“探索”标准收录进来（数量克制，1~2 条即可）。',
+    '7. 顺手把这次维护中发现的好的新来源按“探索”标准收录进来（数量克制，1~2 条即可）。',
     '',
     `约束：${capRulesText(cfg)}`,
   );
@@ -484,7 +512,7 @@ export function buildMaintainPrompt({ docPath, lib, cfg, today = todayStr() }) {
     '- 维护动作（停用/删除/移动/新增）都要在 `## 探索日志` 里各记一行，说明理由。',
     '- 日志只保留最近 40 条，超出删最旧的。',
     '',
-    '完成后给管理员一段简短汇报（停用了几条、新增了几条、公司清单有什么变化），直接输出正文即可（桥接会自动转发，不要调用任何发送工具）。'
+    '完成后给管理员一段简短汇报（停用了几条、新增了几条、公司清单与省钱渠道有什么变化），直接输出正文即可（桥接会自动转发，不要调用任何发送工具）。'
   );
   return lines.join('\n');
 }

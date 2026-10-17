@@ -21,7 +21,9 @@ import {
   shouldMaintain,
   daysSince,
   urlKey,
-  resolveDocPath
+  resolveDocPath,
+  DEALS_CATEGORY,
+  dealsWatchlist
 } from '../src/source-library.js';
 
 let pass = 0;
@@ -40,6 +42,11 @@ const st = libraryStats(lib);
 check('种子来源 > 15 条', st.total > 15, `got ${st.total}`);
 check('分类齐全', lib.categories.length >= 6, `got ${lib.categories.length}`);
 check('公司与组织分类存在', lib.categories.some((c) => c.name.startsWith('公司与组织')));
+check('羊毛与价格情报分类存在', lib.categories.some((c) => c.name === DEALS_CATEGORY));
+const deals = dealsWatchlist(lib, { max: 20 });
+check('羊毛分类有起步来源', deals.length >= 4, `got ${deals.length}`);
+check('羊毛来源都指向可读页面', deals.every((s) => /^https?:\/\//.test(s.url)));
+check('羊毛来源未混入其他分类', dealsWatchlist({ categories: [{ name: '论文与预印本', sources: [{ status: 'active', name: 'x', url: 'https://a.b' }] }] }).length === 0);
 
 console.log('\n[2] 渲染 → 解析 往返一致');
 saveSourceLibrary(doc, lib);
@@ -156,9 +163,28 @@ const mt = buildMaintainPrompt({ docPath: doc, lib: reloaded, cfg: fullCfg, toda
 check('维护提示含大企业刷新', mt.includes('大企业与独角兽'));
 check('维护提示列出公司', mt.includes('OpenAI News') || mt.includes('NVIDIA'));
 check('维护提示含停用要求', mt.includes('retired'));
+check('维护提示含省钱渠道刷新', mt.includes('省钱渠道刷新'));
+check('维护提示列出羊毛来源', mt.includes(DEALS_CATEGORY) && mt.includes('OpenRouter'));
 const digestSrc = buildDigestSourcesText(reloaded, { maxPerCategory: 3 });
 check('早报来源文本含分类标题', digestSrc.includes('【论文与预印本】'));
 check('早报来源文本含网址', digestSrc.includes('http'));
+check('早报来源文本含羊毛分类', digestSrc.includes(`【${DEALS_CATEGORY}】`));
+
+console.log('\n[9b] 羊毛情报板块（早报③）');
+const bridgeSrc = fs.readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8');
+check('早报提示含③板块', /③\s*实用情报/.test(bridgeSrc));
+check('③板块条数可配（maxDeals）', bridgeSrc.includes('maxDeals'));
+check('③板块带开关（dealsSection）', bridgeSrc.includes('dealsSection'));
+check('③板块要求给链接', /必须给出来源链接/.test(bridgeSrc));
+check('③板块要求原样引用页面数字', /实际看到/.test(bridgeSrc));
+check('③板块禁止编造优惠码', /不要编造优惠码/.test(bridgeSrc));
+check('③板块禁止违反条款', /不要引导管理员违反任何服务的条款/.test(bridgeSrc));
+check('③板块区分官方与第三方', /第三方转卖/.test(bridgeSrc));
+check('③板块不许写过期活动', /已经结束的活动/.test(bridgeSrc));
+check('③板块允许当天没有就留空', /宁缺毋滥/.test(bridgeSrc));
+check('③板块列出的方向含额度重置', /额度重置/.test(bridgeSrc));
+check('③板块列出的方向含学生优惠', /教育优惠/.test(bridgeSrc));
+check('③板块随开关可关闭（不硬编码上限）', /maxDeals > 0/.test(bridgeSrc));
 
 console.log('\n[10] 文档不存在时自动落地');
 const fresh = path.join(tmp, 'sub', 'fresh.md');

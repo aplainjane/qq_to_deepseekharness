@@ -194,6 +194,8 @@ DSH 的安装目录、启动用的 node 与 home 路径在 `config.json` 的 `ds
   "windowHours": 24,
   "maxPapers": 5,
   "maxNews": 6,
+  "dealsSection": true,
+  "maxDeals": 4,
   "maxChars": 1800,
   "saveToFile": false,
   "topics": "",
@@ -209,6 +211,8 @@ DSH 的安装目录、启动用的 node 与 home 路径在 `config.json` 的 `ds
 | `catchUpMinutes` | 补跑窗口：错过触发点多久以内仍补发今天的早报，`0` = 不补跑 |
 | `windowHours` | 只整理最近多少小时内的新内容 |
 | `maxPapers` / `maxNews` | 论文 / 动向的条数上限 |
+| `dealsSection` | 是否包含③「实用情报」板块（免费额度 / 限时折扣 / 额度重置 / 低价渠道 / 学生优惠） |
+| `maxDeals` | ③ 板块条数上限，`0` = 不写这个板块（等价于关掉） |
 | `maxChars` | 发到 QQ 的正文长度上限 |
 | `saveToFile` | 是否另外把完整版存成本地 Markdown（`dsh.ownerWorkspace\早报\YYYY-MM-DD.md`）。默认 **`false`**：早报只作为 QQ 聊天文本发给你，不写文件。设为 `true` 才会额外存盘 |
 | `topics` | 关注方向，留空用内置默认清单 |
@@ -316,7 +320,7 @@ QQ 里也可以直接对管理员账号说「早报」立即执行一次、「�
 - 2026-10-16 新增（探索·顺藤摸瓜）：Simon Willison's Weblog —— 线索来自 Hacker News 首页当天高赞讨论…
 ```
 
-- **每个 `##` 分类就是一条探索路径**（论文与预印本 / 科研机构 / 新闻聚合 / 公司与组织 / 中文科技圈 / 社区与讨论）。分类是开放的：AI 觉得有必要时可以新开一个，解析器不会只认默认那几个。
+- **每个 `##` 分类就是一条探索路径**（论文与预印本 / 科研机构 / 新闻聚合 / 公司与组织 / 羊毛与价格情报 / 中文科技圈 / 社区与讨论）。分类是开放的：AI 觉得有必要时可以新开一个（比如实际就新开了「机器人与具身智能」），解析器不会只认默认那几个。
 - **分类名下的表格列顺序固定**（`来源 / 网址 / 用途 / 状态 / 加入日 / 上次验证 / 命中 / 备注`），但解析器是按表头名字定位列的，所以**多一列少一列都不会崩**，手工编辑也不必严格对齐。
 - `状态`：`active` 常用 / `watch` 观察 / `retired` 已停用（保留记录，采集时跳过）。
 - `## 探索日志` 记录「从哪条线索发现了哪个新来源」，保留最近 40 条 —— 这是让探索路径可追溯、也是防止文档无限膨胀的闸门。
@@ -350,16 +354,23 @@ QQ 里也可以直接对管理员账号说「早报」立即执行一次、「�
 状态持久化在 `state/source-library.json`（`lastExploreDate` / `lastMaintainDate` / `exploreRuns` / `maintainRuns` / `lastKind` / `lastAt`）。
 
 ```text
-GET  /api/socialV2/source-library           查看开关、文档路径、分类存量、上次/是否该跑
-POST /api/socialV2/source-library/explore   立即投递一次探索任务
-POST /api/socialV2/source-library/maintain  立即投递一次维护任务
+GET  /api/socialV2/source-library                   查看开关、文档路径、分类存量、上次/是否该跑
+GET  /api/socialV2/source-library/preview?kind=explore|maintain   只看提示词正文，不投递、不改状态
+POST /api/socialV2/source-library/explore           立即投递一次探索任务
+POST /api/socialV2/source-library/maintain          立即投递一次维护任务
+GET  /api/socialV2/daily-digest/preview             预览早报提示词（不投递、不改状态）
 ```
 
 ```bash
-node scripts/console-api.mjs sources            # 看知识库状态与分类存量
-node scripts/console-api.mjs sources-explore    # 立刻探索
-node scripts/console-api.mjs sources-maintain   # 立刻维护
+node scripts/console-api.mjs sources                    # 看知识库状态与分类存量
+node scripts/console-api.mjs sources-explore            # 立刻探索
+node scripts/console-api.mjs sources-maintain           # 立刻维护
+node scripts/console-api.mjs sources-preview-explore    # 只看探索提示词，不投递
+node scripts/console-api.mjs sources-preview-maintain   # 只看维护提示词，不投递
+node scripts/console-api.mjs digest-preview             # 只看早报提示词，不投递
 ```
+
+预览接口是改配置后核对实际效果用的：投递类接口会真的发一条 QQ 消息，预览类只返回文本，适合反复确认（例如验证 `maxDeals: 0` 是否真的去掉了③板块）。
 
 QQ 里对管理员账号可以说「信息源库」看状态、「探索来源」立刻探索、「维护来源」立刻维护。
 
@@ -369,7 +380,7 @@ QQ 里对管理员账号可以说「信息源库」看状态、「探索来源�
 node scripts/test-source-library.mjs
 ```
 
-覆盖 54 个断言：往返一致性、表格转义（内容含 `|` 不能破坏列对齐）、元信息损坏容错、缺列容错、去重键（`www` / 协议 / 尾斜杠 / `utm` 参数）、上限告警、间隔判定与跨月天数、提示词必含项、文档缺失时自动落地种子库、路径解析。
+覆盖 72 个断言：往返一致性、表格转义（内容含 `|` 不能破坏列对齐）、元信息损坏容错、缺列容错、去重键（`www` / 协议 / 尾斜杠 / `utm` 参数）、上限告警、间隔判定与跨月天数、提示词必含项、文档缺失时自动落地种子库、路径解析、羊毛分类与③板块（含「必须给链接/不许编号/不许违反条款」等约束是否真的写进了提示词）。
 
 ### 首次启用会发生什么
 
@@ -378,7 +389,35 @@ node scripts/test-source-library.mjs
 所以第一次启用就会看到 AI 去探索，这是预期行为，不是重复触发。
 
 
+### ③ 实用情报板块（能薅的东西）
+
+早报的第三个板块专门回答「**今天有什么和我的钱包/额度有关的消息**」：新出的免费额度或限时折扣、订阅与 API 的**额度重置**和套餐变更、新的低价或替代渠道、学生/教育优惠、值得一试的试用。
+
+开关与条数：
+
+```json
+"dealsSection": true,   // 关掉就不写这个板块
+"maxDeals": 4           // 条数上限；设 0 也等于关掉
+```
+
+取材来自信息源库里专门的 **「羊毛与价格情报」** 分类（首次生成种子库时会带上：OpenRouter 模型列表、Codex/ChatGPT 更新日志、Cursor 更新日志、Gemini API 价格页、DeepSeek 价格页、V2EX 交易节点、GitHub Student Developer Pack）。想加自己的渠道，直接往这个分类的表格里添一行即可，早报下一轮就会用上。
+
+**这个板块最容易出错，所以提示词里单独加了一组硬约束**（写在采集要求里，和论文/新闻的要求分开）：
+
+- 价格、额度、折扣、有效期必须是**页面上实际看到的、原样引用**，不许凭印象或记忆写数字；
+- **必须给链接**，给不出链接的一律不写；
+- 区分**官方活动**和**第三方转卖**：官方优先，第三方低价/转让渠道只作为情报提一句、明确标注风险，不当推荐；
+- **不许编造**优惠码、邀请码、折扣码、注册链接；
+- 不许引导违反任何服务的条款（共享账号、绕地区限制、滥用试用）；
+- 只写**现在还能用得上**的，已结束的活动和过期优惠券不写；
+- **宁缺毋滥**：当天确实没有就说「今天没看到值得薅的新东西」，不为了凑数写广告。
+
+这些约束针对的是「优惠信息」这一类内容特有的风险——它既有强时效（活动会过期），又特别容易被模型用记忆里的旧数字糊弄，还容易滑向灰产推荐。所以这里的规则比论文板块严格得多：**宁可今天这条板块空着，也不能给一个编出来的折扣或一个用不了的码**。
+
+维护任务也会顺带盯这个分类：失效的渠道、长期没更新的价格页会被标成 `retired`，同时按「探索」标准补进新的省钱渠道。
+
 > 采集侧的边界：科技媒体与社交平台多半需要登录，而早报的设计原则是**只读采集、绝不登录**——提示里写明了“打不开就换来源，不要为了拿数据去登录或输入凭据；宁可少写几条也不要编造”。这是提示词层面的约束（浏览器工具本身具备完整的点击/输入能力），因此早报无法、也不会去拿需要登录才能看到的付费或私密内容；遇到这类站点（例如正文被付费墙或 Cloudflare 拦截）会记录在早报末尾的采集说明里。
+
 
 ## 安装前准备
 
