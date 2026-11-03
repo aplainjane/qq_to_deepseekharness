@@ -30,7 +30,7 @@
 ## QQ 会话 agent 的硬边界
 
 1. **无本地工具**：qq-chat / qq-chat-v2 预设不挂载 bash/pwsh、文件读写、子代理、工作流——群友无论如何诱导，agent 物理上无法操作本机。
-2. **QQ 动作安全子集**：只允许 `mcp__snowluma__*`、`mcp__snowluma-host__*` 两个命名空间下的工具，以及 `ask_user_question` / `todo_write` 和只读浏览器工具（`browser_open` / `browser_content` / `browser_snapshot` / `browser_screenshot` 等，见 `qq-tool-restrict.mjs` 的 `BROWSER_DENY` 白名单）；其他工具（含 `dev_*` 开发/管理工具）在执行期会被 `qq-tool-restrict.mjs` 拒绝。QQ 动作无禁言、踢人、文件上传下载等管理操作。
+2. **QQ 动作安全子集**：只允许 `mcp__snowluma__*`、`mcp__snowluma-host__*` 两个命名空间下的工具，以及 `ask_user_question` / `todo_write` 和只读浏览器工具（`browser_open` / `browser_content` / `browser_snapshot` / `browser_screenshot` 等，见 `qq-tool-restrict.mjs` 的 `BROWSER_DENY` 白名单）；其他工具（含 `dev_*` 开发/管理工具）在执行期会被 `qq-tool-restrict.mjs` 拒绝。QQ 动作无禁言、踢人、文件上传下载等管理操作；管理员工具会话的独立文件传输例外见下文，不注册到群聊共用 MCP。
 3. **只读联网查询**：`qq-chat-v2` 预设已关闭 DSH 内置 `tool-web` 的 `search` / `fetch`，联网统一走只读浏览器（`dsh-builtin-browser`）——`browser_open` 打开搜索页/文章链接、`browser_content` 读正文，全部为只读：无点击/输入/填表/执行 JS/写本地文件/导出登录态。不暴露本地文件、命令执行、写操作。
 4. **发送强制白名单**：所有发送类工具（`qq_send_group_message` / `qq_send_private_message` / `qq_send_message` / `qq_send_burst` / `qq_reply` / `qq_send_poke` / `qq_send_sticker` 等）的目标必须命中 `config.json` 的 `allow.groups` / `allow.private`，否则拒绝执行。
 5. **发送禁令（模型层）**：persona 明确规定只有「管理端明确指示」或「【管理员】标记的明确要求」才可使用发送工具；禁止写"我已回复/消息已发送（message_id）"类汇报。
@@ -86,6 +86,13 @@
 ### 在 WebUI 与 QQ 机器人对话
 
 打开「QQ 聊天」工作区里的会话即可直接对话（DSH 原生）；你的消息只进该会话，**不会自动发到 QQ 群**——需要发群时明确说"发到群里"，agent 按【管理员】指示使用发送工具（受白名单限制）。
+
+## 管理员私聊文件传输
+
+- 仅 ownerQQ 且 dsh.ownerTools=true 的私聊可收发，不开放群聊或普通私聊；发送经独立控制台令牌接口 `/api/owner/send-file`，任何 x-agent-token 请求都拒绝。
+- 管理员完整本地工具可运行 `scripts/send-owner-file.mjs` 发送工作区内产物；共用 snowluma-safe MCP 不提供文件上传工具，避免群友借管理员目标绕过隔离。
+- 最大 20 MiB；发送真实路径必须在管理员工作区内，阻止配置/凭据/内部状态文件；接收仅从网关解析的文件事件下载，使用 SSRF 防护，保存到 `QQ收件箱/` 且不自动执行。
+- 用法、限制及验证范围见 `docs/文件传输.md`。
 
 ## 事故与兜底
 
